@@ -10,7 +10,23 @@ Translating while writing often means copying text into another tool and repeati
 
 ## Status
 
-In development.
+In development. The server currently supports the LSP lifecycle over standard input/output. AI translation is not implemented yet.
+
+## Development
+
+Run the server:
+
+```sh
+go run .
+```
+
+Build an executable for your editor's LSP client:
+
+```sh
+go build -o honnyaku .
+```
+
+The server uses standard input/output for LSP messages and standard error for logs.
 
 ## FAQ
 

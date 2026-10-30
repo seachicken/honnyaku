@@ -1,0 +1,22 @@
+{
+  "name": "seachicken",
+  "interface": {
+    "displayName": "Seachicken Skills"
+  },
+  "plugins": [
+    {
+      "name": "change-understanding",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/seachicken/agent-skills.git",
+        "ref": "main",
+        "path": "./plugins/change-understanding"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
