@@ -25,7 +25,7 @@ func Test_Lifecycle(t *testing.T) {
 	}
 	reader := bufio.NewReader(&output)
 	for i, want := range []string{
-		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{},"serverInfo":{"name":"Honnyaku"}}}`,
+		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}}},"serverInfo":{"name":"Honnyaku"}}}`,
 		`{"jsonrpc":"2.0","id":2,"result":null}`,
 	} {
 		body, err := readMessage(reader)

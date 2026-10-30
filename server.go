@@ -14,6 +14,7 @@ type request struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id"`
 	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
 }
 
 type rpcError struct {
@@ -22,8 +23,28 @@ type rpcError struct {
 }
 
 type initializeResult struct {
-	Capabilities struct{}   `json:"capabilities"`
-	ServerInfo   serverInfo `json:"serverInfo"`
+	Capabilities serverCapabilities `json:"capabilities"`
+	ServerInfo   serverInfo         `json:"serverInfo"`
+}
+
+type serverCapabilities struct {
+	TextDocumentSync textDocumentSyncOptions `json:"textDocumentSync"`
+}
+
+type textDocumentSyncOptions struct {
+	OpenClose bool        `json:"openClose"`
+	Change    int         `json:"change"`
+	Save      saveOptions `json:"save"`
+}
+
+type saveOptions struct {
+	IncludeText bool `json:"includeText"`
+}
+
+type initializationParams struct {
+	InitializationOptions struct {
+		TargetLanguage string `json:"targetLanguage"`
+	} `json:"initializationOptions"`
 }
 
 type serverInfo struct {
@@ -38,8 +59,14 @@ type response struct {
 }
 
 func serve(input io.Reader, output io.Writer) (int, error) {
+	return serveWithAgent(input, output, runAgent)
+}
+
+func serveWithAgent(input io.Reader, output io.Writer, run agent) (int, error) {
 	reader := bufio.NewReader(input)
 	initialized, shutdown := false, false
+	docs := make(map[string]*document)
+	targetLanguage := "English"
 	for {
 		body, err := readMessage(reader)
 		if errors.Is(err, io.EOF) {
@@ -49,7 +76,7 @@ func serve(input io.Reader, output io.Writer) (int, error) {
 			return 1, err
 		}
 		var req request
-		var result *initializeResult
+		var result any
 		var failure *rpcError
 		if err := json.Unmarshal(body, &req); err != nil {
 			req.ID = json.RawMessage("null")
@@ -63,7 +90,12 @@ func serve(input io.Reader, output io.Writer) (int, error) {
 			}
 			return 1, nil
 		} else if len(req.ID) == 0 {
-			// Notifications, including initialized, never receive a response.
+			if initialized && !shutdown {
+				if err := handleDocumentNotification(req, docs, targetLanguage, output, run); err != nil {
+					return 1, err
+				}
+			}
+			// Notifications never receive a response; save results use a separate notification.
 			continue
 		} else if shutdown {
 			failure = &rpcError{-32600, "Server has shut down"}
@@ -76,9 +108,20 @@ func serve(input io.Reader, output io.Writer) (int, error) {
 					failure = &rpcError{-32600, "Server already initialized"}
 					break
 				}
+				var params initializationParams
+				if len(req.Params) > 0 {
+					if err := json.Unmarshal(req.Params, &params); err != nil {
+						failure = &rpcError{-32602, "Invalid initialization parameters"}
+						break
+					}
+				}
+				if strings.TrimSpace(params.InitializationOptions.TargetLanguage) != "" {
+					targetLanguage = params.InitializationOptions.TargetLanguage
+				}
 				initialized = true
 				result = &initializeResult{
-					ServerInfo: serverInfo{Name: "Honnyaku"},
+					ServerInfo:   serverInfo{Name: "Honnyaku"},
+					Capabilities: serverCapabilities{TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1, Save: saveOptions{IncludeText: true}}},
 				}
 			case "shutdown":
 				shutdown = true
