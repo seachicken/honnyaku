@@ -13,10 +13,15 @@ import (
 type agent func(context.Context, agentInput) (string, error)
 
 type agentInput struct {
-	DocumentURI  string
-	Instructions string
-	Text         string
-	OnTokenUsage func(tokenUsage)
+	ListModels        bool
+	OnModels          func([]codexModel)
+	Model             string
+	DocumentURI       string
+	Instructions      string
+	OutputSchema      map[string]any
+	Text              string
+	OnTokenUsage      func(tokenUsage)
+	OnReasoningEffort func(*string)
 }
 
 type tokenUsage struct {
@@ -43,7 +48,12 @@ type codexClient struct {
 	decoder     *json.Decoder
 	nextID      int
 	initialized bool
-	threads     map[string]string
+	threads     map[string]codexThread
+}
+
+type codexThread struct {
+	ID              string
+	ReasoningEffort *string
 }
 
 func (c *codexClient) close() {
@@ -141,33 +151,81 @@ func (c *codexClient) exchange(prompt agentInput) (string, error) {
 			return "", err
 		}
 		c.initialized = true
-		c.threads = make(map[string]string)
+		c.threads = make(map[string]codexThread)
 	}
-	threadID := c.threads[prompt.DocumentURI]
-	if threadID == "" {
+	if prompt.ListModels {
+		models := []codexModel{}
+		cursor := ""
+		seen := map[string]bool{}
+		for {
+			params := map[string]any{"limit": 100, "includeHidden": false}
+			if cursor != "" {
+				params["cursor"] = cursor
+			}
+			var page struct {
+				Data       []codexModel `json:"data"`
+				NextCursor *string      `json:"nextCursor"`
+			}
+			if err := request("model/list", params, &page); err != nil {
+				return "", err
+			}
+			for _, model := range page.Data {
+				if !model.Hidden && model.Model != "" {
+					models = append(models, model)
+				}
+			}
+			if page.NextCursor == nil || *page.NextCursor == "" {
+				break
+			}
+			cursor = *page.NextCursor
+			if seen[cursor] {
+				return "", fmt.Errorf("model/list returned a repeated cursor")
+			}
+			seen[cursor] = true
+		}
+		prompt.OnModels(models)
+		return "", nil
+	}
+	thread := c.threads[prompt.DocumentURI]
+	if thread.ID == "" {
 		var started struct {
-			Thread struct {
+			ReasoningEffort *string `json:"reasoningEffort"`
+			Thread          struct {
 				ID string `json:"id"`
 			} `json:"thread"`
 		}
-		if err := request("thread/start", map[string]any{
+		params := map[string]any{
 			"approvalPolicy": "never", "sandbox": "read-only", "ephemeral": true,
 			"baseInstructions": prompt.Instructions,
-		}, &started); err != nil {
+			"config":           map[string]any{"model_reasoning_effort": "low"},
+		}
+		if prompt.Model != "" {
+			params["model"] = prompt.Model
+		}
+		if err := request("thread/start", params, &started); err != nil {
 			return "", err
 		}
 		if started.Thread.ID == "" {
 			return "", fmt.Errorf("Codex returned an empty thread ID")
 		}
-		threadID = started.Thread.ID
-		c.threads[prompt.DocumentURI] = threadID
+		thread = codexThread{ID: started.Thread.ID, ReasoningEffort: started.ReasoningEffort}
+		c.threads[prompt.DocumentURI] = thread
 	}
+	// Report the resolved value returned by Codex, never the requested fallback.
+	if prompt.OnReasoningEffort != nil {
+		prompt.OnReasoningEffort(thread.ReasoningEffort)
+	}
+	threadID := thread.ID
 	var turn struct {
 		Turn struct {
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if err := request("turn/start", map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": prompt.Text}}}, &turn); err != nil {
+	params := map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": prompt.Text}}}
+	if prompt.OutputSchema != nil {
+		params["outputSchema"] = prompt.OutputSchema
+	}
+	if err := request("turn/start", params, &turn); err != nil {
 		return "", err
 	}
 	if turn.Turn.ID == "" {
@@ -229,4 +287,31 @@ func (c *codexClient) exchange(prompt agentInput) (string, error) {
 			return text, nil
 		}
 	}
+}
+
+// Model capabilities come from Codex, including model-specific reasoning levels.
+type codexModel struct {
+	Model                     string                  `json:"model"`
+	DisplayName               string                  `json:"displayName"`
+	Hidden                    bool                    `json:"hidden"`
+	IsDefault                 bool                    `json:"isDefault"`
+	DefaultReasoningEffort    string                  `json:"defaultReasoningEffort"`
+	SupportedReasoningEfforts []reasoningEffortOption `json:"supportedReasoningEfforts"`
+}
+type reasoningEffortOption struct {
+	ReasoningEffort string `json:"reasoningEffort"`
+}
+
+func (m codexModel) supportsLow() bool {
+	for _, option := range m.SupportedReasoningEfforts {
+		if option.ReasoningEffort == "low" {
+			return true
+		}
+	}
+	return false
+}
+func (c *codexClient) listModels(ctx context.Context) ([]codexModel, error) {
+	var models []codexModel
+	_, err := c.run(ctx, agentInput{ListModels: true, OnModels: func(result []codexModel) { models = result }})
+	return models, err
 }

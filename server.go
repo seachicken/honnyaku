@@ -37,6 +37,7 @@ type initializeResult struct {
 
 type serverCapabilities struct {
 	TextDocumentSync textDocumentSyncOptions `json:"textDocumentSync"`
+	Experimental     map[string]bool         `json:"experimental,omitempty"`
 }
 
 type textDocumentSyncOptions struct {
@@ -52,6 +53,7 @@ type saveOptions struct {
 type initializationParams struct {
 	InitializationOptions struct {
 		TargetLanguage string `json:"targetLanguage"`
+		Model          string `json:"model"`
 	} `json:"initializationOptions"`
 }
 
@@ -69,14 +71,43 @@ type response struct {
 func serve(input io.Reader, output io.Writer) (int, error) {
 	client := &codexClient{}
 	defer client.close()
-	return serveWithAgent(input, output, client.run)
+	return serveWithAgent(input, output, client.run, client.listModels)
 }
 
-func serveWithAgent(input io.Reader, output io.Writer, run agent) (int, error) {
+func serveWithAgent(input io.Reader, output io.Writer, run agent, catalog ...func(context.Context) ([]codexModel, error)) (int, error) {
 	reader := bufio.NewReader(input)
 	initialized, shutdown := false, false
 	docs := make(map[string]*document)
 	targetLanguage := "English"
+	model := ""
+	var knownModels []codexModel
+	catalogLoaded := false
+	refreshCatalog := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		models, err := catalog[0](ctx)
+		update := modelListUpdate{Models: []codexModel{}}
+		if err != nil {
+			update.Error = err.Error()
+		} else {
+			catalogLoaded = true
+			knownModels = models
+			update.Models = models
+			if model == "" {
+				for _, available := range models {
+					if available.Model != "" && !available.Hidden && available.supportsLow() {
+						if model == "" || available.IsDefault {
+							model = available.Model
+						}
+						if available.IsDefault {
+							break
+						}
+					}
+				}
+			}
+		}
+		return writeMessage(output, notification[modelListUpdate]{"2.0", "honnyaku/models", update})
+	}
 messages:
 	for {
 		body, err := readMessage(reader)
@@ -104,6 +135,13 @@ messages:
 			if !initialized || shutdown {
 				continue
 			}
+			if req.Method == "initialized" && len(catalog) > 0 && !catalogLoaded {
+				if err := refreshCatalog(); err != nil {
+					return 1, err
+				}
+				continue messages
+			}
+
 			switch req.Method {
 			case "textDocument/didOpen", "textDocument/didChange", "textDocument/didSave", "textDocument/didClose":
 			default:
@@ -146,10 +184,33 @@ messages:
 				if doc.text == doc.baseline {
 					continue messages
 				}
+				if len(catalog) > 0 && !catalogLoaded {
+					if err := refreshCatalog(); err != nil {
+						return 1, err
+					}
+				}
 				update := translationUpdate{URI: uri, Version: doc.version, TargetLanguage: targetLanguage, Translations: []unitTranslation{}}
 				var usageErr error
 				withUsage := func(ctx context.Context, input agentInput) (string, error) {
+					if len(catalog) > 0 {
+						supported := false
+						for _, available := range knownModels {
+							if available.Model == model && available.supportsLow() {
+								supported = true
+								break
+							}
+						}
+						if !supported {
+							return "", fmt.Errorf("select an available model supporting low reasoning before translating")
+						}
+					}
 					input.DocumentURI = uri
+					input.Model = model
+					input.OnReasoningEffort = func(effort *string) {
+						if usageErr == nil {
+							usageErr = writeMessage(output, notification[reasoningEffortUpdate]{"2.0", "honnyaku/reasoningEffort", reasoningEffortUpdate{URI: uri, ReasoningEffort: effort}})
+						}
+					}
 					input.OnTokenUsage = func(usage tokenUsage) {
 						if usageErr == nil {
 							usageErr = writeMessage(output, notification[tokenUsage]{"2.0", "honnyaku/tokenUsage", usage})
@@ -213,10 +274,11 @@ messages:
 				if strings.TrimSpace(params.InitializationOptions.TargetLanguage) != "" {
 					targetLanguage = params.InitializationOptions.TargetLanguage
 				}
+				model = strings.TrimSpace(params.InitializationOptions.Model)
 				initialized = true
 				result = &initializeResult{
 					ServerInfo:   serverInfo{Name: "Honnyaku"},
-					Capabilities: serverCapabilities{TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1, Save: saveOptions{IncludeText: true}}},
+					Capabilities: serverCapabilities{Experimental: map[string]bool{"honnyakuModelSelection": true, "honnyakuModelCatalog": true}, TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1, Save: saveOptions{IncludeText: true}}},
 				}
 			case "shutdown":
 				shutdown = true
@@ -232,11 +294,7 @@ messages:
 				return 1, err
 			}
 		}
-		body, err = json.Marshal(reply)
-		if err != nil {
-			return 1, err
-		}
-		if _, err := fmt.Fprintf(output, "Content-Length: %d\r\n\r\n%s", len(body), body); err != nil {
+		if err := writeMessage(output, reply); err != nil {
 			return 1, err
 		}
 	}
@@ -312,4 +370,15 @@ func writeMessage(output io.Writer, value any) error {
 	}
 	_, err = fmt.Fprintf(output, "Content-Length: %d\r\n\r\n%s", len(body), body)
 	return err
+}
+
+// A nil effort means Codex did not report a resolved value.
+type reasoningEffortUpdate struct {
+	URI             string  `json:"uri"`
+	ReasoningEffort *string `json:"reasoningEffort"`
+}
+
+type modelListUpdate struct {
+	Models []codexModel `json:"models"`
+	Error  string       `json:"error,omitempty"`
 }

@@ -22,13 +22,13 @@ func Test_Lifecycle(t *testing.T) {
 	for _, message := range messages {
 		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
 	}
-	code, err := serve(&input, &output)
+	code, err := serveWithAgent(&input, &output, func(context.Context, agentInput) (string, error) { t.Fatal("unexpected inference"); return "", nil })
 	if err != nil || code != 0 {
 		t.Fatalf("serve = %d, %v", code, err)
 	}
 	reader := bufio.NewReader(&output)
 	for i, want := range []string{
-		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}}},"serverInfo":{"name":"Honnyaku"}}}`,
+		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"experimental":{"honnyakuModelSelection":true,"honnyakuModelCatalog":true},"textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}}},"serverInfo":{"name":"Honnyaku"}}}`,
 		`{"jsonrpc":"2.0","id":2,"result":null}`,
 	} {
 		body, err := readMessage(reader)
@@ -74,7 +74,7 @@ func Test_Framing(t *testing.T) {
 func Test_SaveTranslationLSP(t *testing.T) {
 	var input, output bytes.Buffer
 	for _, message := range []string{
-		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"targetLanguage":"French"}}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"targetLanguage":"French","model":"  test-model  "}}}`,
 		`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"unchanged\n\nold"}}}`,
 		`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":2},"contentChanges":[{"text":"unchanged\n\n日本語😀\n\n追加"}]}}`,
 		`{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`,
@@ -84,6 +84,11 @@ func Test_SaveTranslationLSP(t *testing.T) {
 	calls := 0
 	code, err := serveWithAgent(&input, &output, func(_ context.Context, input agentInput) (string, error) {
 		calls++
+		effort := "medium"
+		input.OnReasoningEffort(&effort)
+		if input.Model != "test-model" {
+			t.Fatalf("unexpected model: %q", input.Model)
+		}
 		if input.DocumentURI != "file:///a.md" {
 			t.Fatalf("unexpected document URI: %q", input.DocumentURI)
 		}
@@ -94,7 +99,7 @@ func Test_SaveTranslationLSP(t *testing.T) {
 		if !reflect.DeepEqual(params, translationParams{Texts: []string{"日本語😀", "追加"}, TargetLanguage: "French"}) {
 			t.Fatalf("unexpected translation input: %+v", params)
 		}
-		return `["translated", "added"]`, nil
+		return `{"translations":["translated", "added"]}`, nil
 	})
 	if code != 0 || err != nil || calls != 1 {
 		t.Fatalf("code=%d err=%v calls=%d", code, err, calls)
@@ -104,6 +109,17 @@ func Test_SaveTranslationLSP(t *testing.T) {
 		t.Fatal(err)
 	} // initialize
 	body, err := readMessage(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var effortNotification notification[reasoningEffortUpdate]
+	if err := json.Unmarshal(body, &effortNotification); err != nil {
+		t.Fatal(err)
+	}
+	if effortNotification.Method != "honnyaku/reasoningEffort" || effortNotification.Params.URI != "file:///a.md" || effortNotification.Params.ReasoningEffort == nil || *effortNotification.Params.ReasoningEffort != "medium" {
+		t.Fatalf("unexpected effort notification: %s", body)
+	}
+	body, err = readMessage(reader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,5 +143,61 @@ func Test_SaveTranslationLSP(t *testing.T) {
 	}
 	if _, err := readMessage(reader); err != io.EOF {
 		t.Fatalf("unexpected extra message: %v", err)
+	}
+}
+
+func Test_ModelCatalogSelectionAndRecovery(t *testing.T) {
+	low := []reasoningEffortOption{{ReasoningEffort: "low"}}
+	for _, tt := range []struct {
+		name     string
+		selected string
+		models   []codexModel
+		failures int
+		want     string
+	}{
+		{"default", "", []codexModel{{Model: "fallback", SupportedReasoningEfforts: low}, {Model: "default", IsDefault: true, SupportedReasoningEfforts: low}}, 0, "default"},
+		{"eligible fallback", "", []codexModel{{Model: "unsupported", IsDefault: true}, {Model: "fallback", SupportedReasoningEfforts: low}}, 0, "fallback"},
+		{"explicit recovery", "chosen", []codexModel{{Model: "chosen", SupportedReasoningEfforts: low}}, 2, "chosen"},
+		{"omitted recovery", "", []codexModel{{Model: "default", IsDefault: true, SupportedReasoningEfforts: low}}, 2, "default"},
+		{"invalid explicit", "missing", []codexModel{{Model: "default", IsDefault: true, SupportedReasoningEfforts: low}}, 0, ""},
+		{"no eligible model", "", []codexModel{{Model: "unsupported", IsDefault: true}}, 0, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var input, output bytes.Buffer
+			messages := []string{
+				fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"model":%q}}}`, tt.selected),
+				`{"jsonrpc":"2.0","method":"initialized"}`,
+				`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"old"}}}`,
+				`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":2},"contentChanges":[{"text":"new"}]}}`,
+			}
+			// A failed save must preserve the baseline so the next save can recover.
+			for i := 0; i < 3; i++ {
+				messages = append(messages, `{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`)
+			}
+			for _, message := range messages {
+				fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
+			}
+			catalogCalls, runs := 0, 0
+			code, err := serveWithAgent(&input, &output, func(_ context.Context, input agentInput) (string, error) {
+				runs++
+				if input.Model != tt.want || tt.want == "" {
+					t.Fatalf("unexpected selected model %q", input.Model)
+				}
+				return `{"translations":["translated"]}`, nil
+			}, func(context.Context) ([]codexModel, error) {
+				catalogCalls++
+				if catalogCalls <= tt.failures {
+					return nil, fmt.Errorf("temporary catalog failure")
+				}
+				return tt.models, nil
+			})
+			wantRuns := 1
+			if tt.want == "" {
+				wantRuns = 0
+			}
+			if code != 0 || err != nil || runs != wantRuns || catalogCalls != tt.failures+1 {
+				t.Fatalf("code=%d err=%v runs=%d catalogCalls=%d", code, err, runs, catalogCalls)
+			}
+		})
 	}
 }
