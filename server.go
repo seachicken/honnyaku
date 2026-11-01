@@ -2,13 +2,21 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"time"
 )
+
+type document struct {
+	text     string
+	baseline string
+	version  int
+}
 
 type request struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -59,7 +67,9 @@ type response struct {
 }
 
 func serve(input io.Reader, output io.Writer) (int, error) {
-	return serveWithAgent(input, output, runAgent)
+	client := &codexClient{}
+	defer client.close()
+	return serveWithAgent(input, output, client.run)
 }
 
 func serveWithAgent(input io.Reader, output io.Writer, run agent) (int, error) {
@@ -67,6 +77,7 @@ func serveWithAgent(input io.Reader, output io.Writer, run agent) (int, error) {
 	initialized, shutdown := false, false
 	docs := make(map[string]*document)
 	targetLanguage := "English"
+messages:
 	for {
 		body, err := readMessage(reader)
 		if errors.Is(err, io.EOF) {
@@ -90,8 +101,92 @@ func serveWithAgent(input io.Reader, output io.Writer, run agent) (int, error) {
 			}
 			return 1, nil
 		} else if len(req.ID) == 0 {
-			if initialized && !shutdown {
-				if err := handleDocumentNotification(req, docs, targetLanguage, output, run); err != nil {
+			if !initialized || shutdown {
+				continue
+			}
+			switch req.Method {
+			case "textDocument/didOpen", "textDocument/didChange", "textDocument/didSave", "textDocument/didClose":
+			default:
+				continue messages
+			}
+			var params documentParams
+			if err := json.Unmarshal(req.Params, &params); err != nil || params.TextDocument.URI == "" {
+				continue messages
+			}
+			uri := params.TextDocument.URI
+			doc := docs[uri]
+			switch req.Method {
+			case "textDocument/didOpen":
+				if params.TextDocument.LanguageID == "markdown" {
+					docs[uri] = &document{text: params.TextDocument.Text, baseline: params.TextDocument.Text, version: params.TextDocument.Version}
+				}
+			case "textDocument/didClose":
+				delete(docs, uri)
+			case "textDocument/didChange":
+				if doc == nil || params.TextDocument.Version <= doc.version {
+					continue messages
+				}
+				// Full synchronization was negotiated. Ignore unsupported incremental updates.
+				for _, change := range params.ContentChanges {
+					if change.Range != nil {
+						continue messages
+					}
+				}
+				for _, change := range params.ContentChanges {
+					doc.text = change.Text
+				}
+				doc.version = params.TextDocument.Version
+			case "textDocument/didSave":
+				if doc == nil {
+					continue messages
+				}
+				if params.Text != nil {
+					doc.text = *params.Text
+				}
+				if doc.text == doc.baseline {
+					continue messages
+				}
+				update := translationUpdate{URI: uri, Version: doc.version, TargetLanguage: targetLanguage, Translations: []unitTranslation{}}
+				var usageErr error
+				withUsage := func(ctx context.Context, input agentInput) (string, error) {
+					input.DocumentURI = uri
+					input.OnTokenUsage = func(usage tokenUsage) {
+						if usageErr == nil {
+							usageErr = writeMessage(output, notification[tokenUsage]{"2.0", "honnyaku/tokenUsage", usage})
+						}
+					}
+					return run(ctx, input)
+				}
+
+				units := changedTranslationUnits(doc.baseline, doc.text)
+				var translationErr error
+				if len(units) > 0 {
+					texts := make([]string, len(units))
+					for i, unit := range units {
+						texts[i] = unit.Text
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+					translated, err := translate(ctx, translationParams{Texts: texts, TargetLanguage: targetLanguage}, withUsage)
+					cancel()
+					if usageErr != nil {
+						return 1, usageErr
+					}
+					translationErr = err
+					for i, unit := range units {
+						item := unitTranslation{Range: unit.Range, SourceText: unit.Text}
+						if err != nil {
+							item.Error = err.Error()
+						} else {
+							item.Text = translated[i]
+						}
+						update.Translations = append(update.Translations, item)
+					}
+				}
+				if translationErr == nil {
+					doc.baseline = doc.text
+				}
+
+				if err := writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", update}); err != nil {
 					return 1, err
 				}
 			}
@@ -177,4 +272,44 @@ func readMessage(reader *bufio.Reader) ([]byte, error) {
 	body := make([]byte, length)
 	_, err := io.ReadFull(reader, body)
 	return body, err
+}
+
+type unitTranslation struct {
+	Range      textRange `json:"range"`
+	SourceText string    `json:"sourceText"`
+	Text       string    `json:"text,omitempty"`
+	Error      string    `json:"error,omitempty"`
+}
+type translationUpdate struct {
+	URI            string            `json:"uri"`
+	Version        int               `json:"version"`
+	TargetLanguage string            `json:"targetLanguage"`
+	Translations   []unitTranslation `json:"translations"`
+}
+type notification[P any] struct {
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	Params  P      `json:"params"`
+}
+type documentParams struct {
+	TextDocument struct {
+		URI        string `json:"uri"`
+		LanguageID string `json:"languageId"`
+		Version    int    `json:"version"`
+		Text       string `json:"text"`
+	} `json:"textDocument"`
+	ContentChanges []struct {
+		Range *textRange `json:"range"`
+		Text  string     `json:"text"`
+	} `json:"contentChanges"`
+	Text *string `json:"text"`
+}
+
+func writeMessage(output io.Writer, value any) error {
+	body, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(output, "Content-Length: %d\r\n\r\n%s", len(body), body)
+	return err
 }

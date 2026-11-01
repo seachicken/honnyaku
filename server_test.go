@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"reflect"
 	"testing"
 )
 
@@ -65,5 +68,64 @@ func Test_Framing(t *testing.T) {
 		if _, err := readMessage(bufio.NewReader(bytes.NewBufferString(input))); err == nil {
 			t.Errorf("expected error for %q", input)
 		}
+	}
+}
+
+func Test_SaveTranslationLSP(t *testing.T) {
+	var input, output bytes.Buffer
+	for _, message := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"targetLanguage":"French"}}}`,
+		`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"unchanged\n\nold"}}}`,
+		`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":2},"contentChanges":[{"text":"unchanged\n\n日本語😀\n\n追加"}]}}`,
+		`{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`,
+	} {
+		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
+	}
+	calls := 0
+	code, err := serveWithAgent(&input, &output, func(_ context.Context, input agentInput) (string, error) {
+		calls++
+		if input.DocumentURI != "file:///a.md" {
+			t.Fatalf("unexpected document URI: %q", input.DocumentURI)
+		}
+		var params translationParams
+		if err := json.Unmarshal([]byte(input.Text), &params); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(params, translationParams{Texts: []string{"日本語😀", "追加"}, TargetLanguage: "French"}) {
+			t.Fatalf("unexpected translation input: %+v", params)
+		}
+		return `["translated", "added"]`, nil
+	})
+	if code != 0 || err != nil || calls != 1 {
+		t.Fatalf("code=%d err=%v calls=%d", code, err, calls)
+	}
+	reader := bufio.NewReader(&output)
+	if _, err := readMessage(reader); err != nil {
+		t.Fatal(err)
+	} // initialize
+	body, err := readMessage(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got notification[translationUpdate]
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := notification[translationUpdate]{
+		JSONRPC: "2.0",
+		Method:  "honnyaku/translations",
+		Params: translationUpdate{
+			URI: "file:///a.md", Version: 2, TargetLanguage: "French",
+			Translations: []unitTranslation{
+				{Range: textRange{position{2, 0}, position{2, 5}}, SourceText: "日本語😀", Text: "translated"},
+				{Range: textRange{position{4, 0}, position{4, 2}}, SourceText: "追加", Text: "added"},
+			},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	if _, err := readMessage(reader); err != io.EOF {
+		t.Fatalf("unexpected extra message: %v", err)
 	}
 }
