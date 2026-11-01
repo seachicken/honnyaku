@@ -7,15 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type document struct {
-	text     string
-	baseline string
-	version  int
+	text    string
+	version int
 }
 
 type request struct {
@@ -52,8 +54,9 @@ type saveOptions struct {
 
 type initializationParams struct {
 	InitializationOptions struct {
-		TargetLanguage string `json:"targetLanguage"`
-		Model          string `json:"model"`
+		TargetLanguage      string              `json:"targetLanguage"`
+		Model               string              `json:"model"`
+		InitialTranslations []translationUpdate `json:"initialTranslations"`
 	} `json:"initializationOptions"`
 }
 
@@ -75,6 +78,10 @@ func serve(input io.Reader, output io.Writer) (int, error) {
 }
 
 func serveWithAgent(input io.Reader, output io.Writer, run agent, catalog ...func(context.Context) ([]codexModel, error)) (int, error) {
+	return serveWithCache(input, output, run, &translationCache{}, catalog...)
+}
+
+func serveWithCache(input io.Reader, output io.Writer, run agent, cache *translationCache, catalog ...func(context.Context) ([]codexModel, error)) (int, error) {
 	reader := bufio.NewReader(input)
 	initialized, shutdown := false, false
 	docs := make(map[string]*document)
@@ -107,6 +114,80 @@ func serveWithAgent(input io.Reader, output io.Writer, run agent, catalog ...fun
 			}
 		}
 		return writeMessage(output, notification[modelListUpdate]{"2.0", "honnyaku/models", update})
+	}
+
+	translateSaved := func(uri string, doc *document) error {
+		cached, units := cache.selectUnits(uri, targetLanguage, doc.text)
+
+		if len(catalog) > 0 && !catalogLoaded {
+			if err := refreshCatalog(); err != nil {
+				return err
+			}
+		}
+		update := translationUpdate{URI: uri, Version: doc.version, TargetLanguage: targetLanguage, Translations: cached}
+		var usageErr error
+		withUsage := func(ctx context.Context, input agentInput) (string, error) {
+			if len(catalog) > 0 {
+				supported := false
+				for _, available := range knownModels {
+					if available.Model == model && available.supportsLow() {
+						supported = true
+						break
+					}
+				}
+				if !supported {
+					return "", fmt.Errorf("select an available model supporting low reasoning before translating")
+				}
+			}
+			input.DocumentURI = uri
+			input.Model = model
+			input.OnReasoningEffort = func(effort *string) {
+				if usageErr == nil {
+					usageErr = writeMessage(output, notification[reasoningEffortUpdate]{"2.0", "honnyaku/reasoningEffort", reasoningEffortUpdate{URI: uri, ReasoningEffort: effort}})
+				}
+			}
+			input.OnTokenUsage = func(usage tokenUsage) {
+				if usageErr == nil {
+					usageErr = writeMessage(output, notification[tokenUsage]{"2.0", "honnyaku/tokenUsage", usage})
+				}
+			}
+			return run(ctx, input)
+		}
+
+		if len(units) > 0 {
+			pending := translationUpdate{URI: uri, Version: doc.version, TargetLanguage: targetLanguage, Pending: true, Translations: []unitTranslation{}}
+			for _, unit := range units {
+				pending.Translations = append(pending.Translations, unitTranslation{Range: unit.Range, SourceText: unit.Text})
+			}
+			if err := writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", pending}); err != nil {
+				return err
+			}
+			texts := make([]string, len(units))
+			for i, unit := range units {
+				texts[i] = unit.Text
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			translated, err := translate(ctx, translationParams{Texts: texts, TargetLanguage: targetLanguage}, withUsage)
+			cancel()
+			if usageErr != nil {
+				return usageErr
+			}
+			for i, unit := range units {
+				item := unitTranslation{Range: unit.Range, SourceText: unit.Text}
+				if err != nil {
+					item.Error = err.Error()
+				} else {
+					item.Text = translated[i]
+					cache.remember(uri, targetLanguage, item.SourceText, item.Text)
+				}
+				update.Translations = append(update.Translations, item)
+			}
+		}
+
+		sort.SliceStable(update.Translations, func(i, j int) bool {
+			return update.Translations[i].Range.Start.Line < update.Translations[j].Range.Start.Line
+		})
+		return writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", update})
 	}
 messages:
 	for {
@@ -156,7 +237,14 @@ messages:
 			switch req.Method {
 			case "textDocument/didOpen":
 				if params.TextDocument.LanguageID == "markdown" {
-					docs[uri] = &document{text: params.TextDocument.Text, baseline: params.TextDocument.Text, version: params.TextDocument.Version}
+					docs[uri] = &document{text: params.TextDocument.Text, version: params.TextDocument.Version}
+					cached, _ := cache.selectUnits(uri, targetLanguage, params.TextDocument.Text)
+					if len(cached) > 0 {
+						update := translationUpdate{URI: uri, Version: params.TextDocument.Version, TargetLanguage: targetLanguage, Translations: cached, Restored: true}
+						if err := writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", update}); err != nil {
+							return 1, err
+						}
+					}
 				}
 			case "textDocument/didClose":
 				delete(docs, uri)
@@ -181,73 +269,7 @@ messages:
 				if params.Text != nil {
 					doc.text = *params.Text
 				}
-				if doc.text == doc.baseline {
-					continue messages
-				}
-				if len(catalog) > 0 && !catalogLoaded {
-					if err := refreshCatalog(); err != nil {
-						return 1, err
-					}
-				}
-				update := translationUpdate{URI: uri, Version: doc.version, TargetLanguage: targetLanguage, Translations: []unitTranslation{}}
-				var usageErr error
-				withUsage := func(ctx context.Context, input agentInput) (string, error) {
-					if len(catalog) > 0 {
-						supported := false
-						for _, available := range knownModels {
-							if available.Model == model && available.supportsLow() {
-								supported = true
-								break
-							}
-						}
-						if !supported {
-							return "", fmt.Errorf("select an available model supporting low reasoning before translating")
-						}
-					}
-					input.DocumentURI = uri
-					input.Model = model
-					input.OnReasoningEffort = func(effort *string) {
-						if usageErr == nil {
-							usageErr = writeMessage(output, notification[reasoningEffortUpdate]{"2.0", "honnyaku/reasoningEffort", reasoningEffortUpdate{URI: uri, ReasoningEffort: effort}})
-						}
-					}
-					input.OnTokenUsage = func(usage tokenUsage) {
-						if usageErr == nil {
-							usageErr = writeMessage(output, notification[tokenUsage]{"2.0", "honnyaku/tokenUsage", usage})
-						}
-					}
-					return run(ctx, input)
-				}
-
-				units := changedTranslationUnits(doc.baseline, doc.text)
-				var translationErr error
-				if len(units) > 0 {
-					texts := make([]string, len(units))
-					for i, unit := range units {
-						texts[i] = unit.Text
-					}
-					ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-					translated, err := translate(ctx, translationParams{Texts: texts, TargetLanguage: targetLanguage}, withUsage)
-					cancel()
-					if usageErr != nil {
-						return 1, usageErr
-					}
-					translationErr = err
-					for i, unit := range units {
-						item := unitTranslation{Range: unit.Range, SourceText: unit.Text}
-						if err != nil {
-							item.Error = err.Error()
-						} else {
-							item.Text = translated[i]
-						}
-						update.Translations = append(update.Translations, item)
-					}
-				}
-				if translationErr == nil {
-					doc.baseline = doc.text
-				}
-
-				if err := writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", update}); err != nil {
+				if err := translateSaved(uri, doc); err != nil {
 					return 1, err
 				}
 			}
@@ -275,6 +297,18 @@ messages:
 					targetLanguage = params.InitializationOptions.TargetLanguage
 				}
 				model = strings.TrimSpace(params.InitializationOptions.Model)
+				for i := len(params.InitializationOptions.InitialTranslations) - 1; i >= 0; i-- {
+					update := params.InitializationOptions.InitialTranslations[i]
+					if update.Pending {
+						continue
+					}
+					for j := len(update.Translations) - 1; j >= 0; j-- {
+						item := update.Translations[j]
+						if item.Error == "" {
+							cache.importTranslation(update.URI, update.TargetLanguage, item.SourceText, item.Text)
+						}
+					}
+				}
 				initialized = true
 				result = &initializeResult{
 					ServerInfo:   serverInfo{Name: "Honnyaku"},
@@ -335,7 +369,7 @@ func readMessage(reader *bufio.Reader) ([]byte, error) {
 type unitTranslation struct {
 	Range      textRange `json:"range"`
 	SourceText string    `json:"sourceText"`
-	Text       string    `json:"text,omitempty"`
+	Text       string    `json:"text"`
 	Error      string    `json:"error,omitempty"`
 }
 type translationUpdate struct {
@@ -343,6 +377,8 @@ type translationUpdate struct {
 	Version        int               `json:"version"`
 	TargetLanguage string            `json:"targetLanguage"`
 	Translations   []unitTranslation `json:"translations"`
+	Restored       bool              `json:"restored,omitempty"`
+	Pending        bool              `json:"pending,omitempty"`
 }
 type notification[P any] struct {
 	JSONRPC string `json:"jsonrpc"`
@@ -381,4 +417,107 @@ type reasoningEffortUpdate struct {
 type modelListUpdate struct {
 	Models []codexModel `json:"models"`
 	Error  string       `json:"error,omitempty"`
+}
+
+// The client owns persistence and seeds this per-process memory cache on initialization.
+type translationCacheKey struct{ uri, language string }
+type translationCache struct {
+	files map[translationCacheKey]map[string]string
+}
+
+func cacheKey(uri, language string) translationCacheKey {
+	if parsed, err := url.Parse(uri); err == nil {
+		uri = strings.ToLower(parsed.Scheme) + "://" + parsed.Host + path.Clean(parsed.Path)
+	}
+	return translationCacheKey{uri: uri, language: language}
+}
+
+func (c *translationCache) entries(uri, language string) map[string]string {
+	key := cacheKey(uri, language)
+	if c.files == nil {
+		c.files = make(map[translationCacheKey]map[string]string)
+	}
+	if c.files[key] == nil {
+		c.files[key] = make(map[string]string)
+	}
+	return c.files[key]
+}
+
+func (c *translationCache) remember(uri, language, source, translated string) {
+	c.entries(uri, language)[source] = translated
+}
+
+func (c *translationCache) importTranslation(uri, language, source, translated string) {
+	if uri == "" || language == "" || strings.TrimSpace(source) == "" {
+		return
+	}
+	if _, exists := c.entries(uri, language)[source]; !exists {
+		c.remember(uri, language, source, translated)
+	}
+	originalLines, translatedLines := strings.Split(source, "\n"), strings.Split(translated, "\n")
+	if len(originalLines) > 1 && len(originalLines) == len(translatedLines) {
+		for i, line := range originalLines {
+			c.importTranslation(uri, language, line, translatedLines[i])
+		}
+	}
+}
+
+func (c *translationCache) selectUnits(uri, language, source string) ([]unitTranslation, []translationUnit) {
+	entries := c.entries(uri, language)
+	all := translationUnits(source)
+	cached := []unitTranslation{}
+	covered := make(map[int]bool)
+	// Preserve previously stored paragraph results during migration, even when they aren't line-aligned.
+	var paragraphs []string
+	for text := range entries {
+		if strings.Contains(text, "\n") {
+			paragraphs = append(paragraphs, text)
+		}
+	}
+	sort.Slice(paragraphs, func(i, j int) bool {
+		if len(paragraphs[i]) == len(paragraphs[j]) {
+			return paragraphs[i] < paragraphs[j]
+		}
+		return len(paragraphs[i]) > len(paragraphs[j])
+	})
+	lines := strings.Split(source, "\n")
+	for _, text := range paragraphs {
+		original := strings.Split(text, "\n")
+		for start := 0; start+len(original) <= len(lines); start++ {
+			end := start + len(original) - 1
+			if strings.Join(lines[start:end+1], "\n") != text {
+				continue
+			}
+			overlaps := false
+			for line := start; line <= end; line++ {
+				if covered[line] {
+					overlaps = true
+				}
+			}
+			if overlaps {
+				continue
+			}
+			last := translationUnits(original[len(original)-1])
+			endCharacter := 0
+			if len(last) > 0 {
+				endCharacter = last[0].Range.End.Character
+			}
+			cached = append(cached, unitTranslation{Range: textRange{position{start, 0}, position{end, endCharacter}}, SourceText: text, Text: entries[text]})
+			for line := start; line <= end; line++ {
+				covered[line] = true
+			}
+		}
+	}
+	var missing []translationUnit
+	for _, unit := range all {
+		if covered[unit.Range.Start.Line] {
+			continue
+		}
+		if text, ok := entries[unit.Text]; ok {
+			cached = append(cached, unitTranslation{Range: unit.Range, SourceText: unit.Text, Text: text})
+		} else {
+			missing = append(missing, unit)
+		}
+	}
+	return cached, missing
 }
