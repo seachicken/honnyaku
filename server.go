@@ -43,13 +43,8 @@ type serverCapabilities struct {
 }
 
 type textDocumentSyncOptions struct {
-	OpenClose bool        `json:"openClose"`
-	Change    int         `json:"change"`
-	Save      saveOptions `json:"save"`
-}
-
-type saveOptions struct {
-	IncludeText bool `json:"includeText"`
+	OpenClose bool `json:"openClose"`
+	Change    int  `json:"change"`
 }
 
 type initializationParams struct {
@@ -116,8 +111,15 @@ func serveWithCache(input io.Reader, output io.Writer, run agent, cache *transla
 		return writeMessage(output, notification[modelListUpdate]{"2.0", "honnyaku/models", update})
 	}
 
-	translateSaved := func(uri string, doc *document) error {
+	translateVisible := func(uri string, doc *document, visible lineWindow) error {
 		cached, units := cache.selectUnits(uri, targetLanguage, doc.text)
+		selected := units[:0]
+		for _, unit := range units {
+			if unit.Range.Start.Line >= visible.StartLine && unit.Range.Start.Line < visible.EndLine {
+				selected = append(selected, unit)
+			}
+		}
+		units = selected
 
 		if len(catalog) > 0 && !catalogLoaded {
 			if err := refreshCatalog(); err != nil {
@@ -224,7 +226,7 @@ messages:
 			}
 
 			switch req.Method {
-			case "textDocument/didOpen", "textDocument/didChange", "textDocument/didSave", "textDocument/didClose":
+			case "textDocument/didOpen", "textDocument/didChange", "textDocument/didClose":
 			default:
 				continue messages
 			}
@@ -262,18 +264,8 @@ messages:
 					doc.text = change.Text
 				}
 				doc.version = params.TextDocument.Version
-			case "textDocument/didSave":
-				if doc == nil {
-					continue messages
-				}
-				if params.Text != nil {
-					doc.text = *params.Text
-				}
-				if err := translateSaved(uri, doc); err != nil {
-					return 1, err
-				}
 			}
-			// Notifications never receive a response; save results use a separate notification.
+			// Document synchronization does not trigger translation.
 			continue
 		} else if shutdown {
 			failure = &rpcError{-32600, "Server has shut down"}
@@ -312,7 +304,26 @@ messages:
 				initialized = true
 				result = &initializeResult{
 					ServerInfo:   serverInfo{Name: "Honnyaku"},
-					Capabilities: serverCapabilities{Experimental: map[string]bool{"honnyakuModelSelection": true, "honnyakuModelCatalog": true}, TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1, Save: saveOptions{IncludeText: true}}},
+					Capabilities: serverCapabilities{Experimental: map[string]bool{"honnyakuViewportTranslation": true, "honnyakuModelSelection": true, "honnyakuModelCatalog": true}, TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1}},
+				}
+			case "honnyaku/translateVisible":
+				var params visibleTranslationParams
+				if err := json.Unmarshal(req.Params, &params); err != nil ||
+					params.TextDocument.URI == "" || params.StartLine < 0 || params.EndLine <= params.StartLine {
+					failure = &rpcError{-32602, "Invalid visible translation parameters"}
+					break
+				}
+				uri := params.TextDocument.URI
+				doc := docs[uri]
+				if doc == nil || params.TextDocument.Version < doc.version {
+					failure = &rpcError{-32801, "Document is closed or has changed"}
+					break
+				}
+				// The request carries an atomic snapshot: document sync may still be queued
+				// by the IDE when an edit and a viewport event arrive together.
+				doc.text, doc.version = params.TextDocument.Text, params.TextDocument.Version
+				if err := translateVisible(uri, doc, params.lineWindow); err != nil {
+					return 1, err
 				}
 			case "shutdown":
 				shutdown = true
@@ -396,7 +407,6 @@ type documentParams struct {
 		Range *textRange `json:"range"`
 		Text  string     `json:"text"`
 	} `json:"contentChanges"`
-	Text *string `json:"text"`
 }
 
 func writeMessage(output io.Writer, value any) error {
@@ -520,4 +530,18 @@ func (c *translationCache) selectUnits(uri, language, source string) ([]unitTran
 		}
 	}
 	return cached, missing
+}
+
+// EndLine is exclusive. The client owns viewport padding and request coalescing.
+type lineWindow struct {
+	StartLine int `json:"startLine"`
+	EndLine   int `json:"endLine"`
+}
+type visibleTranslationParams struct {
+	TextDocument struct {
+		URI     string `json:"uri"`
+		Version int    `json:"version"`
+		Text    string `json:"text"`
+	} `json:"textDocument"`
+	lineWindow
 }

@@ -29,7 +29,7 @@ func Test_Lifecycle(t *testing.T) {
 	}
 	reader := bufio.NewReader(&output)
 	for i, want := range []string{
-		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"experimental":{"honnyakuModelSelection":true,"honnyakuModelCatalog":true},"textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":true}}},"serverInfo":{"name":"Honnyaku"}}}`,
+		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"experimental":{"honnyakuModelSelection":true,"honnyakuModelCatalog":true,"honnyakuViewportTranslation":true},"textDocumentSync":{"openClose":true,"change":1}},"serverInfo":{"name":"Honnyaku"}}}`,
 		`{"jsonrpc":"2.0","id":2,"result":null}`,
 	} {
 		body, err := readMessage(reader)
@@ -72,13 +72,13 @@ func Test_Framing(t *testing.T) {
 	}
 }
 
-func Test_SaveTranslationLSP(t *testing.T) {
+func Test_VisibleTranslationLSP(t *testing.T) {
 	var input, output bytes.Buffer
 	for _, message := range []string{
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"targetLanguage":"French","model":"  test-model  "}}}`,
 		`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"unchanged\n\nold"}}}`,
 		`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":2},"contentChanges":[{"text":"unchanged\n\n日本語😀\n\n追加"}]}}`,
-		`{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`,
+		translateSnapshot(2, "unchanged\n\n日本語😀\n\n追加"),
 	} {
 		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
 	}
@@ -151,6 +151,14 @@ func Test_SaveTranslationLSP(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v, want %+v", got, want)
 	}
+	body, err = readMessage(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reply response
+	if err := json.Unmarshal(body, &reply); err != nil || reply.Error != nil || string(reply.Result) != "null" {
+		t.Fatalf("request was not acknowledged: %s", body)
+	}
 	if _, err := readMessage(reader); err != io.EOF {
 		t.Fatalf("unexpected extra message: %v", err)
 	}
@@ -180,9 +188,9 @@ func Test_ModelCatalogSelectionAndRecovery(t *testing.T) {
 				`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"old"}}}`,
 				`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":2},"contentChanges":[{"text":"new"}]}}`,
 			}
-			// A failed save must not cache a failure; the next save must retry.
+			// A failed request must not cache a failure; the next request must retry.
 			for i := 0; i < 3; i++ {
-				messages = append(messages, `{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`)
+				messages = append(messages, translateSnapshot(2, "new"))
 			}
 			for _, message := range messages {
 				fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
@@ -218,11 +226,11 @@ func Test_AppendLineSendsOnlyAddedLineInSameConversation(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
 		`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"元の行"}}}`,
 		`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":2},"contentChanges":[{"text":"翻訳する行"}]}}`,
-		`{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`,
+		translateSnapshot(2, "翻訳する行"),
 		`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":3},"contentChanges":[{"text":"翻訳する行\n追加の行"}]}}`,
-		`{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`,
+		translateSnapshot(3, "翻訳する行\n追加の行"),
 		`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":4},"contentChanges":[{"text":"翻訳する行\n\n追加の行\n"}]}}`,
-		`{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`,
+		translateSnapshot(4, "翻訳する行\n\n追加の行\n"),
 	} {
 		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
 	}
@@ -293,9 +301,19 @@ func runCacheSession(t *testing.T, cache *translationCache, run agent, messages 
 
 const initializeEnglish = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
 const openUnchanged = `{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"already\nuntouched"}}}`
-const saveUnchanged = `{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`
+const saveNotification = `{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`
 
-func Test_StandardSavesTranslateMissingAndReuseAllExistingLines(t *testing.T) {
+var translateUnchanged = translateSnapshot(1, "already\nuntouched")
+
+func translateSnapshot(version int, text string) string {
+	data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 100 + version, "method": "honnyaku/translateVisible", "params": map[string]any{
+		"textDocument": map[string]any{"uri": "file:///a.md", "version": version, "text": text},
+		"startLine":    0, "endLine": len(strings.Split(text, "\n")),
+	}})
+	return string(data)
+}
+
+func Test_VisibleRequestsTranslateMissingAndReuseAllExistingLines(t *testing.T) {
 	var calls [][]string
 	run := func(_ context.Context, request agentInput) (string, error) {
 		if request.DocumentURI != "file:///a.md" {
@@ -314,9 +332,9 @@ func Test_StandardSavesTranslateMissingAndReuseAllExistingLines(t *testing.T) {
 		return string(data), nil
 	}
 	updates := runCacheSession(t, &translationCache{}, run, initializeEnglish, openUnchanged,
-		saveUnchanged, saveUnchanged,
+		translateUnchanged, translateUnchanged,
 		`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":2},"contentChanges":[{"text":"already\nuntouched\nadded"}]}}`,
-		saveUnchanged)
+		translateSnapshot(2, "already\nuntouched\nadded"))
 	if !reflect.DeepEqual(calls, [][]string{{"already", "untouched"}, {"added"}}) {
 		t.Fatalf("unexpected inference: %q", calls)
 	}
@@ -337,7 +355,7 @@ func Test_ClientRestoresResultsIntoNewServerWithoutInferenceOnOpen(t *testing.T)
 	saved := runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
 		calls++
 		return `{"translations":["already", ""]}`, nil
-	}, initializeEnglish, openUnchanged, saveUnchanged)
+	}, initializeEnglish, openUnchanged, translateUnchanged)
 	if calls != 1 {
 		t.Fatalf("runs = %d", calls)
 	}
@@ -352,7 +370,7 @@ func Test_ClientRestoresResultsIntoNewServerWithoutInferenceOnOpen(t *testing.T)
 	updates := runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
 		t.Fatal("client-supplied cached results must not invoke inference")
 		return "", nil
-	}, string(initialized), openUnchanged, saveUnchanged)
+	}, string(initialized), openUnchanged, translateUnchanged)
 	if len(updates) != 2 || !updates[0].Restored || len(updates[0].Translations) != 2 {
 		t.Fatalf("restore = %+v", updates)
 	}
@@ -364,13 +382,13 @@ func Test_ClientRestoresResultsIntoNewServerWithoutInferenceOnOpen(t *testing.T)
 	runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
 		calls++
 		return `{"translations":["already", ""]}`, nil
-	}, initializeEnglish, openUnchanged, saveUnchanged)
+	}, initializeEnglish, openUnchanged, translateUnchanged)
 	if calls != 1 {
 		t.Fatal("server cache unexpectedly shared across process lifetimes")
 	}
 }
 
-func Test_OnlySuccessfulTranslationsAreCachedAndFailuresRetryOnSave(t *testing.T) {
+func Test_OnlySuccessfulTranslationsAreCachedAndFailuresRetryOnRequest(t *testing.T) {
 	calls := 0
 	updates := runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
 		calls++
@@ -378,7 +396,7 @@ func Test_OnlySuccessfulTranslationsAreCachedAndFailuresRetryOnSave(t *testing.T
 			return "", fmt.Errorf("temporary failure")
 		}
 		return `{"translations":["one", "two"]}`, nil
-	}, initializeEnglish, openUnchanged, saveUnchanged, saveUnchanged, saveUnchanged)
+	}, initializeEnglish, openUnchanged, translateUnchanged, translateUnchanged, translateUnchanged)
 	if calls != 2 {
 		t.Fatalf("runs = %d", calls)
 	}
@@ -394,7 +412,7 @@ func Test_LegacyInitializationImportsTranslationsWithoutOverwritingNewerCache(t 
 		t.Fatal("migrated results must not invoke the agent")
 		return "", nil
 	}, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"initialTranslations":[{"uri":"file:/a.md","targetLanguage":"English","translations":[{"sourceText":"already","text":"old"},{"sourceText":"untouched","text":"migrated"}]}]}}}`,
-		openUnchanged, saveUnchanged)
+		openUnchanged, translateUnchanged)
 	if len(updates) != 2 || updates[0].Translations[0].Text != "newer" || updates[0].Translations[1].Text != "migrated" {
 		t.Fatalf("migration = %+v", updates)
 	}
@@ -436,5 +454,67 @@ func Test_LegacyParagraphCacheKeepsCoverageWithoutRetranslatingIndividualLines(t
 	cached, missing := cache.selectUnits("file:///a.md", "English", "first\nsecond\nthird")
 	if len(cached) != 1 || cached[0].Text != "paragraph" || len(missing) != 1 || missing[0].Text != "third" {
 		t.Fatalf("cached=%+v missing=%+v", cached, missing)
+	}
+}
+
+func Test_ViewportTranslationSkipsSavesAndReusesScrolledLines(t *testing.T) {
+	var calls [][]string
+	run := func(_ context.Context, request agentInput) (string, error) {
+		var params translationParams
+		if err := json.Unmarshal([]byte(request.Text), &params); err != nil {
+			t.Fatal(err)
+		}
+		calls = append(calls, params.Texts)
+		var texts []string
+		for _, text := range params.Texts {
+			texts = append(texts, strings.ToUpper(text))
+		}
+		data, _ := json.Marshal(map[string]any{"translations": texts})
+		return string(data), nil
+	}
+	request := func(id, version, start, end int, text string) string {
+		data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": "honnyaku/translateVisible", "params": map[string]any{
+			"textDocument": map[string]any{"uri": "file:///a.md", "version": version, "text": text}, "startLine": start, "endLine": end,
+		}})
+		return string(data)
+	}
+	updates := runCacheSession(t, &translationCache{}, run,
+		initializeEnglish,
+		openUnchanged, saveNotification,
+		request(2, 1, 0, 1, "already\nuntouched"),
+		request(3, 1, 1, 2, "already\nuntouched"),
+		request(4, 1, 0, 2, "already\nuntouched"),
+		request(5, 2, 0, 1, "edited\nuntouched"),
+		request(6, 1, 0, 2, "already\nuntouched"), // stale snapshot must not replace v2
+		saveNotification,
+	)
+	if !reflect.DeepEqual(calls, [][]string{{"already"}, {"untouched"}, {"edited"}}) {
+		t.Fatalf("calls: %q", calls)
+	}
+	var completed []translationUpdate
+	for _, update := range updates {
+		if !update.Pending {
+			completed = append(completed, update)
+		}
+	}
+	if len(completed) != 4 {
+		t.Fatalf("unexpected completions: %+v", completed)
+	}
+	if got := completed[1].Translations; len(got) != 2 || got[1].Range.Start.Line != 1 {
+		t.Fatalf("cached lines or source ranges lost: %+v", got)
+	}
+	if got := completed[3]; got.Version != 2 || len(got.Translations) != 2 || got.Translations[0].Text != "EDITED" {
+		t.Fatalf("edited snapshot: %+v", got)
+	}
+}
+
+func Test_ViewportTranslationRejectsInvalidWindows(t *testing.T) {
+	for _, window := range []string{`"startLine":-1,"endLine":2`, `"startLine":2,"endLine":2`, `"startLine":4,"endLine":1`} {
+		runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
+			t.Fatal("invalid window invoked inference")
+			return "", nil
+		},
+			initializeEnglish, openUnchanged,
+			`{"jsonrpc":"2.0","id":2,"method":"honnyaku/translateVisible","params":{"textDocument":{"uri":"file:///a.md","version":1,"text":"already\nuntouched"},`+window+`}}`)
 	}
 }
