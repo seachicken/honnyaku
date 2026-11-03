@@ -29,7 +29,7 @@ func Test_Lifecycle(t *testing.T) {
 	}
 	reader := bufio.NewReader(&output)
 	for i, want := range []string{
-		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"experimental":{"honnyakuModelSelection":true,"honnyakuModelCatalog":true,"honnyakuViewportTranslation":true},"textDocumentSync":{"openClose":true,"change":1}},"serverInfo":{"name":"Honnyaku"}}}`,
+		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"experimental":{"honnyakuRangeTranslation":true,"honnyakuModelSelection":true,"honnyakuModelCatalog":true,"honnyakuViewportTranslation":true},"textDocumentSync":{"openClose":true,"change":1}},"serverInfo":{"name":"Honnyaku"}}}`,
 		`{"jsonrpc":"2.0","id":2,"result":null}`,
 	} {
 		body, err := readMessage(reader)

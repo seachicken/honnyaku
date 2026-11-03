@@ -111,8 +111,18 @@ func serveWithCache(input io.Reader, output io.Writer, run agent, cache *transla
 		return writeMessage(output, notification[modelListUpdate]{"2.0", "honnyaku/models", update})
 	}
 
-	translateVisible := func(uri string, doc *document, visible lineWindow) error {
+	translateVisible := func(uri string, doc *document, visible lineWindow, ranges *[]textRange) error {
 		cached, units := cache.selectUnits(uri, targetLanguage, doc.text)
+		if ranges != nil {
+			cached, units = []unitTranslation{}, nil
+			for _, unit := range rangedTranslationUnits(doc.text, *ranges) {
+				if text, ok := cache.entries(uri, targetLanguage)[unit.Text]; ok {
+					cached = append(cached, unitTranslation{Range: unit.Range, SourceText: unit.Text, Text: text})
+				} else {
+					units = append(units, unit)
+				}
+			}
+		}
 		selected := units[:0]
 		for _, unit := range units {
 			if unit.Range.Start.Line >= visible.StartLine && unit.Range.Start.Line < visible.EndLine {
@@ -238,10 +248,10 @@ messages:
 			doc := docs[uri]
 			switch req.Method {
 			case "textDocument/didOpen":
-				if params.TextDocument.LanguageID == "markdown" {
+				if params.TextDocument.LanguageID != "" {
 					docs[uri] = &document{text: params.TextDocument.Text, version: params.TextDocument.Version}
 					cached, _ := cache.selectUnits(uri, targetLanguage, params.TextDocument.Text)
-					if len(cached) > 0 {
+					if len(cached) > 0 && (params.TextDocument.LanguageID == "markdown" || params.TextDocument.LanguageID == "plaintext") {
 						update := translationUpdate{URI: uri, Version: params.TextDocument.Version, TargetLanguage: targetLanguage, Translations: cached, Restored: true}
 						if err := writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", update}); err != nil {
 							return 1, err
@@ -304,7 +314,7 @@ messages:
 				initialized = true
 				result = &initializeResult{
 					ServerInfo:   serverInfo{Name: "Honnyaku"},
-					Capabilities: serverCapabilities{Experimental: map[string]bool{"honnyakuViewportTranslation": true, "honnyakuModelSelection": true, "honnyakuModelCatalog": true}, TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1}},
+					Capabilities: serverCapabilities{Experimental: map[string]bool{"honnyakuRangeTranslation": true, "honnyakuViewportTranslation": true, "honnyakuModelSelection": true, "honnyakuModelCatalog": true}, TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1}},
 				}
 			case "honnyaku/translateVisible":
 				var params visibleTranslationParams
@@ -312,6 +322,12 @@ messages:
 					params.TextDocument.URI == "" || params.StartLine < 0 || params.EndLine <= params.StartLine {
 					failure = &rpcError{-32602, "Invalid visible translation parameters"}
 					break
+				}
+				if params.Ranges != nil {
+					if err := validateTranslationRanges(params.TextDocument.Text, *params.Ranges); err != nil {
+						failure = &rpcError{-32602, err.Error()}
+						break
+					}
 				}
 				uri := params.TextDocument.URI
 				doc := docs[uri]
@@ -322,7 +338,7 @@ messages:
 				// The request carries an atomic snapshot: document sync may still be queued
 				// by the IDE when an edit and a viewport event arrive together.
 				doc.text, doc.version = params.TextDocument.Text, params.TextDocument.Version
-				if err := translateVisible(uri, doc, params.lineWindow); err != nil {
+				if err := translateVisible(uri, doc, params.lineWindow, params.Ranges); err != nil {
 					return 1, err
 				}
 			case "shutdown":
@@ -544,4 +560,5 @@ type visibleTranslationParams struct {
 		Text    string `json:"text"`
 	} `json:"textDocument"`
 	lineWindow
+	Ranges *[]textRange `json:"ranges"`
 }
