@@ -29,7 +29,7 @@ func Test_Lifecycle(t *testing.T) {
 	}
 	reader := bufio.NewReader(&output)
 	for i, want := range []string{
-		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"experimental":{"honnyakuRangeTranslation":true,"honnyakuModelSelection":true,"honnyakuModelCatalog":true,"honnyakuViewportTranslation":true},"textDocumentSync":{"openClose":true,"change":1}},"serverInfo":{"name":"Honnyaku"}}}`,
+		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"experimental":{"honnyakuCacheDeletion":true,"honnyakuRangeTranslation":true,"honnyakuModelSelection":true,"honnyakuModelCatalog":true,"honnyakuViewportTranslation":true},"textDocumentSync":{"openClose":true,"change":1}},"serverInfo":{"name":"Honnyaku"}}}`,
 		`{"jsonrpc":"2.0","id":2,"result":null}`,
 	} {
 		body, err := readMessage(reader)
@@ -516,5 +516,37 @@ func Test_ViewportTranslationRejectsInvalidWindows(t *testing.T) {
 		},
 			initializeEnglish, openUnchanged,
 			`{"jsonrpc":"2.0","id":2,"method":"honnyaku/translateVisible","params":{"textDocument":{"uri":"file:///a.md","version":1,"text":"already\nuntouched"},`+window+`}}`)
+	}
+}
+
+func Test_ClearTranslationCache(t *testing.T) {
+	var input, output bytes.Buffer
+	for _, message := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"targetLanguage":"English","initialTranslations":[{"uri":"file:///a.md","targetLanguage":"English","translations":[{"sourceText":"source","text":"old"}]},{"uri":"file:///a.md","targetLanguage":"French","translations":[{"sourceText":"source","text":"fr"}]},{"uri":"file:///b.md","targetLanguage":"English","translations":[{"sourceText":"source","text":"other"}]}]}}}`,
+		`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"source"}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"honnyaku/clearTranslationCache","params":{"uri":"file:/a.md","targetLanguage":"French"}}`,
+		translateSnapshot(1, "source"),
+		`{"jsonrpc":"2.0","id":3,"method":"honnyaku/clearTranslationCache","params":{"uri":"file:/a.md","targetLanguage":"English"}}`,
+		translateSnapshot(1, "source"),
+		`{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///b.md","languageId":"markdown","version":1,"text":"source"}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"honnyaku/translateVisible","params":{"textDocument":{"uri":"file:///b.md","version":1,"text":"source"},"startLine":0,"endLine":1}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"honnyaku/clearTranslationCache","params":{"uri":"file:///a.md"}}`,
+	} {
+		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
+	}
+	calls := 0
+	_, err := serveWithAgent(&input, &output, func(_ context.Context, in agentInput) (string, error) {
+		calls++
+		if in.DocumentURI != "file:///a.md" {
+			t.Fatalf("unexpected document: %s", in.DocumentURI)
+		}
+		return `{"translations":["new"]}`, nil
+	})
+	if err != nil || calls != 1 {
+		t.Fatalf("serve error = %v, calls = %d", err, calls)
+	}
+	if !strings.Contains(output.String(), `"text":"new"`) || !strings.Contains(output.String(), `"text":"other"`) ||
+		!strings.Contains(output.String(), `"code":-32602`) {
+		t.Fatalf("unexpected output: %s", &output)
 	}
 }

@@ -314,8 +314,19 @@ messages:
 				initialized = true
 				result = &initializeResult{
 					ServerInfo:   serverInfo{Name: "Honnyaku"},
-					Capabilities: serverCapabilities{Experimental: map[string]bool{"honnyakuRangeTranslation": true, "honnyakuViewportTranslation": true, "honnyakuModelSelection": true, "honnyakuModelCatalog": true}, TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1}},
+					Capabilities: serverCapabilities{Experimental: map[string]bool{"honnyakuCacheDeletion": true, "honnyakuRangeTranslation": true, "honnyakuViewportTranslation": true, "honnyakuModelSelection": true, "honnyakuModelCatalog": true}, TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1}},
 				}
+			case "honnyaku/clearTranslationCache":
+				var params struct {
+					URI            string `json:"uri"`
+					TargetLanguage string `json:"targetLanguage"`
+				}
+				if err := json.Unmarshal(req.Params, &params); err != nil ||
+					strings.TrimSpace(params.URI) == "" || strings.TrimSpace(params.TargetLanguage) == "" {
+					failure = &rpcError{-32602, "Invalid cache deletion parameters"}
+					break
+				}
+				delete(cache.files, cacheKey(params.URI, params.TargetLanguage))
 			case "honnyaku/translateVisible":
 				var params visibleTranslationParams
 				if err := json.Unmarshal(req.Params, &params); err != nil ||
