@@ -50,7 +50,7 @@ func Test_MissingTranslationUnits(t *testing.T) {
 	}
 }
 
-func TestTranslatePreservesLicenseLineCount(t *testing.T) {
+func Test_TranslatePreservesLicenseLineCount(t *testing.T) {
 	// A wrapped license paragraph must remain one output per supplied source line.
 	texts := []string{"Permission is hereby granted, free of charge, to any person obtaining a copy", "of this software and associated documentation files (the Software), to deal"}
 	want := []string{"許可を取得する者に対し、無償で許諾します。", "本ソフトウェアおよび関連文書について、"}
@@ -64,16 +64,16 @@ func TestTranslatePreservesLicenseLineCount(t *testing.T) {
 		}
 		output, _ := json.Marshal(map[string]any{"translations": want})
 		return string(output), nil
-	})
+	}, nil)
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("translate = %v, %v", got, err)
 	}
 }
 
-func TestTranslateRejectsMismatchedCount(t *testing.T) {
+func Test_TranslateRejectsMismatchedCount(t *testing.T) {
 	_, err := translate(context.Background(), translationParams{Texts: []string{"first", "second"}}, func(context.Context, agentInput) (string, error) {
 		return `{"translations":["merged"]}`, nil
-	})
+	}, nil)
 	if err == nil || !strings.Contains(err.Error(), "expected 2 translations, got 1") {
 		t.Fatalf("error = %v", err)
 	}
@@ -172,5 +172,28 @@ func Test_RangeProtocol(t *testing.T) {
 				t.Fatalf("responses: %s", output.String())
 			}
 		})
+	}
+}
+
+func Test_StreamingTranslationStrings(t *testing.T) {
+	want := []string{"日本語\n引用\"と\\", "second"}
+	encoded, _ := json.Marshal(map[string]any{"translations": want})
+	var got []string
+	result, err := translate(context.Background(), translationParams{Texts: []string{"a", "b"}}, func(_ context.Context, input agentInput) (string, error) {
+		for _, b := range encoded {
+			input.OnTextDelta(string([]byte{b}))
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("not delivered before completion: %q", got)
+		}
+		return string(encoded), nil
+	}, func(i int, text string) {
+		if i != len(got) {
+			t.Fatalf("duplicate or unordered index %d", i)
+		}
+		got = append(got, text)
+	})
+	if err != nil || !reflect.DeepEqual(result, want) {
+		t.Fatalf("result %q, %v", result, err)
 	}
 }

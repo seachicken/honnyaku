@@ -20,6 +20,7 @@ type agentInput struct {
 	Instructions      string
 	OutputSchema      map[string]any
 	Text              string
+	OnTextDelta       func(string)
 	OnTokenUsage      func(tokenUsage)
 	OnReasoningEffort func(*string)
 }
@@ -232,6 +233,7 @@ func (c *codexClient) exchange(prompt agentInput) (string, error) {
 		return "", fmt.Errorf("Codex returned an empty turn ID")
 	}
 	var text string
+	phases := map[string]string{}
 	for {
 		var msg appMessage
 		var err error
@@ -247,9 +249,12 @@ func (c *codexClient) exchange(prompt agentInput) (string, error) {
 			TokenUsage *struct {
 				Total tokenUsage `json:"total"`
 			} `json:"tokenUsage"`
+			ItemID   string `json:"itemId"`
+			Delta    string `json:"delta"`
 			ThreadID string `json:"threadId"`
 			TurnID   string `json:"turnId"`
 			Item     struct {
+				ID    string `json:"id"`
 				Type  string `json:"type"`
 				Text  string `json:"text"`
 				Phase string `json:"phase"`
@@ -267,6 +272,12 @@ func (c *codexClient) exchange(prompt agentInput) (string, error) {
 		}
 		if event.ThreadID != threadID {
 			continue
+		}
+		if msg.Method == "item/started" && event.TurnID == turn.Turn.ID {
+			phases[event.Item.ID] = event.Item.Phase
+		}
+		if msg.Method == "item/agentMessage/delta" && event.TurnID == turn.Turn.ID && phases[event.ItemID] != "commentary" && prompt.OnTextDelta != nil {
+			prompt.OnTextDelta(event.Delta)
 		}
 		if msg.Method == "thread/tokenUsage/updated" && event.TurnID == turn.Turn.ID && event.TokenUsage != nil && prompt.OnTokenUsage != nil {
 			prompt.OnTokenUsage(event.TokenUsage.Total)

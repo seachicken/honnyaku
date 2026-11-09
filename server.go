@@ -179,7 +179,15 @@ func serveWithCache(input io.Reader, output io.Writer, run agent, cache *transla
 				texts[i] = unit.Text
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			translated, err := translate(ctx, translationParams{Texts: texts, TargetLanguage: targetLanguage}, withUsage)
+			progress := append([]unitTranslation{}, cached...)
+			translated, err := translate(ctx, translationParams{Texts: texts, TargetLanguage: targetLanguage}, withUsage, func(i int, text string) {
+				progress = append(progress, unitTranslation{Range: units[i].Range, SourceText: units[i].Text, Text: text})
+				if usageErr == nil {
+					usageErr = writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", translationUpdate{
+						URI: uri, Version: doc.version, TargetLanguage: targetLanguage, Partial: true, Translations: progress,
+					}})
+				}
+			})
 			cancel()
 			if usageErr != nil {
 				return usageErr
@@ -417,6 +425,7 @@ type translationUpdate struct {
 	Translations   []unitTranslation `json:"translations"`
 	Restored       bool              `json:"restored,omitempty"`
 	Pending        bool              `json:"pending,omitempty"`
+	Partial        bool              `json:"partial,omitempty"`
 }
 type notification[P any] struct {
 	JSONRPC string `json:"jsonrpc"`

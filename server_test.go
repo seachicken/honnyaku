@@ -268,51 +268,6 @@ func Test_AppendLineSendsOnlyAddedLineInSameConversation(t *testing.T) {
 	}
 }
 
-func runCacheSession(t *testing.T, cache *translationCache, run agent, messages ...string) []translationUpdate {
-	t.Helper()
-	var input, output bytes.Buffer
-	for _, message := range messages {
-		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
-	}
-	code, err := serveWithCache(&input, &output, run, cache)
-	if err != nil || code != 0 {
-		t.Fatalf("serve = %d, %v", code, err)
-	}
-	var updates []translationUpdate
-	reader := bufio.NewReader(&output)
-	for {
-		body, err := readMessage(reader)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		var result notification[translationUpdate]
-		if err := json.Unmarshal(body, &result); err != nil {
-			t.Fatal(err)
-		}
-		if result.Method == "honnyaku/translations" {
-			updates = append(updates, result.Params)
-		}
-	}
-	return updates
-}
-
-const initializeEnglish = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
-const openUnchanged = `{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"already\nuntouched"}}}`
-const saveNotification = `{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`
-
-var translateUnchanged = translateSnapshot(1, "already\nuntouched")
-
-func translateSnapshot(version int, text string) string {
-	data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 100 + version, "method": "honnyaku/translateVisible", "params": map[string]any{
-		"textDocument": map[string]any{"uri": "file:///a.md", "version": version, "text": text},
-		"startLine":    0, "endLine": len(strings.Split(text, "\n")),
-	}})
-	return string(data)
-}
-
 func Test_VisibleRequestsTranslateMissingAndReuseAllExistingLines(t *testing.T) {
 	var calls [][]string
 	run := func(_ context.Context, request agentInput) (string, error) {
@@ -549,4 +504,66 @@ func Test_ClearTranslationCache(t *testing.T) {
 		!strings.Contains(output.String(), `"code":-32602`) {
 		t.Fatalf("unexpected output: %s", &output)
 	}
+}
+
+func Test_ServerStreamsBeforeCompletionAndDoesNotCacheFailure(t *testing.T) {
+	cache := &translationCache{}
+	updates := runCacheSession(t, cache, func(_ context.Context, input agentInput) (string, error) {
+		input.OnTextDelta(`{"translations":["first",`)
+		if len(cache.entries("file:///a.md", "English")) != 0 {
+			t.Fatal("partial result cached")
+		}
+		return "", context.DeadlineExceeded
+	}, initializeEnglish, openUnchanged, translateUnchanged)
+	if len(updates) != 3 || !updates[0].Pending || !updates[1].Partial || updates[1].Translations[0].Text != "first" || updates[2].Partial || updates[2].Translations[0].Error == "" {
+		t.Fatalf("unexpected updates: %+v", updates)
+	}
+	if len(cache.entries("file:///a.md", "English")) != 0 {
+		t.Fatal("failed turn cached")
+	}
+}
+
+func runCacheSession(t *testing.T, cache *translationCache, run agent, messages ...string) []translationUpdate {
+	t.Helper()
+	var input, output bytes.Buffer
+	for _, message := range messages {
+		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
+	}
+	code, err := serveWithCache(&input, &output, run, cache)
+	if err != nil || code != 0 {
+		t.Fatalf("serve = %d, %v", code, err)
+	}
+	var updates []translationUpdate
+	reader := bufio.NewReader(&output)
+	for {
+		body, err := readMessage(reader)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result notification[translationUpdate]
+		if err := json.Unmarshal(body, &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Method == "honnyaku/translations" {
+			updates = append(updates, result.Params)
+		}
+	}
+	return updates
+}
+
+const initializeEnglish = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
+const openUnchanged = `{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///a.md","languageId":"markdown","version":1,"text":"already\nuntouched"}}}`
+const saveNotification = `{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///a.md"}}}`
+
+var translateUnchanged = translateSnapshot(1, "already\nuntouched")
+
+func translateSnapshot(version int, text string) string {
+	data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 100 + version, "method": "honnyaku/translateVisible", "params": map[string]any{
+		"textDocument": map[string]any{"uri": "file:///a.md", "version": version, "text": text},
+		"startLine":    0, "endLine": len(strings.Split(text, "\n")),
+	}})
+	return string(data)
 }
