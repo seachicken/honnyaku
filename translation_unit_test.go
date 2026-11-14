@@ -50,35 +50,6 @@ func Test_MissingTranslationUnits(t *testing.T) {
 	}
 }
 
-func Test_TranslatePreservesLicenseLineCount(t *testing.T) {
-	// A wrapped license paragraph must remain one output per supplied source line.
-	texts := []string{"Permission is hereby granted, free of charge, to any person obtaining a copy", "of this software and associated documentation files (the Software), to deal"}
-	want := []string{"許可を取得する者に対し、無償で許諾します。", "本ソフトウェアおよび関連文書について、"}
-	got, err := translate(context.Background(), translationParams{Texts: texts, TargetLanguage: "Japanese"}, func(_ context.Context, input agentInput) (string, error) {
-		schema := input.OutputSchema["properties"].(map[string]any)["translations"].(map[string]any)
-		if schema["minItems"] != len(texts) || schema["maxItems"] != len(texts) {
-			t.Fatalf("output length is not constrained: %+v", schema)
-		}
-		if !strings.Contains(input.Instructions, "Never merge") {
-			t.Fatal("missing fragment instruction")
-		}
-		output, _ := json.Marshal(map[string]any{"translations": want})
-		return string(output), nil
-	}, nil)
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("translate = %v, %v", got, err)
-	}
-}
-
-func Test_TranslateRejectsMismatchedCount(t *testing.T) {
-	_, err := translate(context.Background(), translationParams{Texts: []string{"first", "second"}}, func(context.Context, agentInput) (string, error) {
-		return `{"translations":["merged"]}`, nil
-	}, nil)
-	if err == nil || !strings.Contains(err.Error(), "expected 2 translations, got 1") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
 func Test_RangedTranslationUnits(t *testing.T) {
 	source := "😀 code // hello\n/* first\nsecond */ code"
 	ranges := []textRange{{position{0, 8}, position{0, 16}}, {position{1, 0}, position{2, 9}}}
@@ -155,8 +126,13 @@ func Test_RangeProtocol(t *testing.T) {
 				if err := json.Unmarshal([]byte(in.Text), &params); err != nil {
 					t.Fatal(err)
 				}
-				got = append(got, params.Texts...)
-				data, _ := json.Marshal(map[string]any{"translations": params.Texts})
+				for _, line := range params.Lines {
+					got = append(got, line.Text)
+				}
+				data, err := json.Marshal(map[string]any{"lines": params.Lines})
+				if err != nil {
+					t.Fatal(err)
+				}
 				return string(data), nil
 			}, cache)
 			if code != 0 || err != nil {
@@ -175,25 +151,159 @@ func Test_RangeProtocol(t *testing.T) {
 	}
 }
 
-func Test_StreamingTranslationStrings(t *testing.T) {
-	want := []string{"日本語\n引用\"と\\", "second"}
-	encoded, _ := json.Marshal(map[string]any{"translations": want})
-	var got []string
-	result, err := translate(context.Background(), translationParams{Texts: []string{"a", "b"}}, func(_ context.Context, input agentInput) (string, error) {
-		for _, b := range encoded {
-			input.OnTextDelta(string([]byte{b}))
+func Test_NumberedTranslationsMapByPosition(t *testing.T) {
+	params := translationParams{TargetLanguage: "ja", Lines: []translationLine{
+		{Line: 2, Text: "The CLI snapshots Git configuration once during branch discovery instead of"},
+		{Line: 3, Text: "starting git config for each remote and branch setting."},
+		{Line: 8, Text: "## Results (2026-11-13)"},
+		{Line: 8, Character: 30, Text: "comment"},
+	}}
+	got, err := translate(context.Background(), params, nil, func(_ context.Context, in agentInput) (string, error) {
+		var received translationParams
+		if err := json.Unmarshal([]byte(in.Text), &received); err != nil {
+			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("not delivered before completion: %q", got)
+		if !reflect.DeepEqual(received, params) {
+			t.Fatalf("input = %+v", received)
 		}
-		return string(encoded), nil
-	}, func(i int, text string) {
-		if i != len(got) {
-			t.Fatalf("duplicate or unordered index %d", i)
+		if in.OnTextDelta != nil {
+			t.Fatal("unvalidated streaming enabled")
 		}
-		got = append(got, text)
+		return `{"lines":[{"line":8,"character":30,"text":"コメント"},{"line":8,"character":0,"text":"## 結果（2026-11-13）"},{"line":3,"character":0,"text":"設定ごとの起動を省きます。"},{"line":2,"character":0,"text":"CLI は設定を一度取得し、"}]}`, nil
 	})
-	if err != nil || !reflect.DeepEqual(result, want) {
-		t.Fatalf("result %q, %v", result, err)
+	want := []string{"CLI は設定を一度取得し、", "設定ごとの起動を省きます。", "## 結果（2026-11-13）", "コメント"}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+func Test_InvalidNumberedTranslationsRetryThenFail(t *testing.T) {
+	for _, output := range []string{
+		`{"lines":[]}`,
+		`{"lines":[{"line":2,"character":0,"text":"a"},{"line":2,"character":0,"text":"b"}]}`,
+		`{"lines":[{"line":2,"character":0,"text":"a"},{"line":9,"character":0,"text":"b"}]}`,
+		`{"lines":[{"line":2,"character":0,"text":"a\nb"},{"line":3,"character":0,"text":"c"}]}`,
+		`{"lines":[{"line":2,"character":0,"text":"a\rb"},{"line":3,"character":0,"text":"c"}]}`,
+		`{"lines":[{"line":2,"character":0,"text":" "},{"line":3,"character":0,"text":"b"}]}`,
+		`{"lines":[{"line":2,"text":"a"},{"line":3,"character":0,"text":"b"}]}`,
+		`{"lines":[{"line":2,"character":0,"text":"a"},{"line":3,"character":0,"text":"b"}]} {}`,
+	} {
+		t.Run(output, func(t *testing.T) {
+			calls := 0
+			got, err := translate(context.Background(), translationParams{Lines: []translationLine{{Line: 2, Text: "first"}, {Line: 3, Text: "second"}}}, nil, func(_ context.Context, in agentInput) (string, error) {
+				calls++
+				if calls == 2 && !strings.Contains(in.Instructions, "previous response was invalid") {
+					t.Fatal("retry lacks error")
+				}
+				return output, nil
+			})
+			if err == nil || got != nil || calls != 2 {
+				t.Fatalf("got %q, %v; calls=%d", got, err, calls)
+			}
+		})
+	}
+}
+
+func Test_AgentErrorsDoNotRetry(t *testing.T) {
+	calls := 0
+	_, err := translate(context.Background(), translationParams{}, nil, func(context.Context, agentInput) (string, error) { calls++; return "", fmt.Errorf("agent failure") })
+	if err == nil || calls != 1 {
+		t.Fatal("agent errors must not retry")
+	}
+}
+
+func translationReply(t *testing.T, input agentInput, texts []string) string {
+	t.Helper()
+	var params translationParams
+	if err := json.Unmarshal([]byte(input.Text), &params); err != nil {
+		t.Fatal(err)
+	}
+	lines := params.Lines
+	if len(texts) != len(lines) {
+		t.Fatalf("reply has %d texts for %d input lines", len(texts), len(lines))
+	}
+	for i := range lines {
+		lines[i].Text = texts[i]
+	}
+	data, err := json.Marshal(map[string]any{"lines": lines})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func Test_NumberedLinesStreamBeforeAgentCompletion(t *testing.T) {
+	params := translationParams{Lines: []translationLine{{Line: 2, Text: "first"}, {Line: 8, Character: 3, Text: "second"}}}
+	want := []translationLine{{Line: 8, Character: 3, Text: "引用\"と\\日本語😀"}, {Line: 2, Text: "最初"}}
+	output, err := json.Marshal(map[string]any{"lines": want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var progress [][]translationLine
+	got, err := translate(context.Background(), params, func(lines []translationLine) {
+		progress = append(progress, append([]translationLine(nil), lines...))
+	}, func(_ context.Context, in agentInput) (string, error) {
+		// Byte-sized chunks split UTF-8 characters, escape sequences, and JSON objects.
+		for _, b := range output {
+			in.OnTextDelta(string([]byte{b}))
+		}
+		if len(progress) != 2 || !reflect.DeepEqual(progress[0], want[:1]) || !reflect.DeepEqual(progress[1], want) {
+			t.Fatalf("progress before agent completion = %+v", progress)
+		}
+		return string(output), nil
+	})
+	if err != nil || !reflect.DeepEqual(got, []string{want[1].Text, want[0].Text}) {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+func Test_InvalidStreamedLinesAreNotPublished(t *testing.T) {
+	for _, invalid := range []string{
+		`{"line":99,"character":0,"text":"unknown"}`,
+		`{"line":2,"character":0,"text":"duplicate"}`,
+		`{"line":3,"character":0,"text":"two\nlines"}`,
+		`{"line":3,"text":"missing column"}`,
+	} {
+		t.Run(invalid, func(t *testing.T) {
+			var progress []translationLine
+			_, err := translate(context.Background(), translationParams{Lines: []translationLine{{Line: 2, Text: "first"}, {Line: 3, Text: "second"}}}, func(lines []translationLine) { progress = append([]translationLine(nil), lines...) }, func(_ context.Context, in agentInput) (string, error) {
+				in.OnTextDelta(`{"lines":[{"line":2,"character":0,"text":"valid"},` + invalid + `,{"line":3,"character":0,"text":"later"}]}`)
+				if !reflect.DeepEqual(progress, []translationLine{{Line: 2, Text: "valid"}}) {
+					t.Fatalf("invalid result published: %+v", progress)
+				}
+				return "", context.DeadlineExceeded
+			})
+			if err == nil {
+				t.Fatal("expected failure")
+			}
+		})
+	}
+}
+
+func Test_RetryClearsPreviousStreamedLines(t *testing.T) {
+	params := translationParams{Lines: []translationLine{{Line: 2, Text: "first"}, {Line: 3, Text: "second"}}}
+	var progress []translationLine
+	resets, calls := 0, 0
+	got, err := translate(context.Background(), params, func(lines []translationLine) {
+		if len(lines) == 0 {
+			resets++
+		}
+		progress = append([]translationLine(nil), lines...)
+	}, func(_ context.Context, in agentInput) (string, error) {
+		calls++
+		if calls == 1 {
+			partial := `{"lines":[{"line":2,"character":0,"text":"old"}]}`
+			in.OnTextDelta(partial)
+			return partial, nil
+		}
+		if resets != 1 || len(progress) != 0 {
+			t.Fatalf("retry retained stale progress: %+v", progress)
+		}
+		result := translationReply(t, in, []string{"new first", "new second"})
+		in.OnTextDelta(result)
+		return result, nil
+	})
+	if err != nil || calls != 2 || !reflect.DeepEqual(got, []string{"new first", "new second"}) {
+		t.Fatalf("got %q, %v (%d calls)", got, err, calls)
 	}
 }

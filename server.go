@@ -174,20 +174,35 @@ func serveWithCache(input io.Reader, output io.Writer, run agent, cache *transla
 			if err := writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", pending}); err != nil {
 				return err
 			}
-			texts := make([]string, len(units))
+			lines := make([]translationLine, len(units))
 			for i, unit := range units {
-				texts[i] = unit.Text
+				lines[i] = translationLine{Line: unit.Range.Start.Line, Character: unit.Range.Start.Character, Text: unit.Text}
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-			progress := append([]unitTranslation{}, cached...)
-			translated, err := translate(ctx, translationParams{Texts: texts, TargetLanguage: targetLanguage}, withUsage, func(i int, text string) {
-				progress = append(progress, unitTranslation{Range: units[i].Range, SourceText: units[i].Text, Text: text})
-				if usageErr == nil {
-					usageErr = writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", translationUpdate{
-						URI: uri, Version: doc.version, TargetLanguage: targetLanguage, Partial: true, Translations: progress,
-					}})
+			translated, err := translate(ctx, translationParams{Lines: lines, TargetLanguage: targetLanguage}, func(lines []translationLine) {
+				if usageErr != nil {
+					return
 				}
-			})
+				if len(lines) == 0 {
+					// A retry discards the previous attempt's provisional text and restores its pending lines.
+					usageErr = writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", pending})
+					if usageErr != nil {
+						return
+					}
+				}
+				progress := append([]unitTranslation{}, cached...)
+				for _, line := range lines {
+					for _, unit := range units {
+						if unit.Range.Start.Line == line.Line && unit.Range.Start.Character == line.Character {
+							progress = append(progress, unitTranslation{Range: unit.Range, SourceText: unit.Text, Text: line.Text})
+							break
+						}
+					}
+				}
+				usageErr = writeMessage(output, notification[translationUpdate]{"2.0", "honnyaku/translations", translationUpdate{
+					URI: uri, Version: doc.version, TargetLanguage: targetLanguage, Partial: true, Translations: progress,
+				}})
+			}, withUsage)
 			cancel()
 			if usageErr != nil {
 				return usageErr

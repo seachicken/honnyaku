@@ -23,7 +23,10 @@ func Test_Lifecycle(t *testing.T) {
 	for _, message := range messages {
 		fmt.Fprintf(&input, "Content-Length: %d\r\n\r\n%s", len(message), message)
 	}
-	code, err := serveWithAgent(&input, &output, func(context.Context, agentInput) (string, error) { t.Fatal("unexpected inference"); return "", nil })
+	code, err := serveWithAgent(&input, &output, func(_ context.Context, input agentInput) (string, error) {
+		t.Fatal("unexpected inference")
+		return "", nil
+	})
 	if err != nil || code != 0 {
 		t.Fatalf("serve = %d, %v", code, err)
 	}
@@ -97,10 +100,10 @@ func Test_VisibleTranslationLSP(t *testing.T) {
 		if err := json.Unmarshal([]byte(input.Text), &params); err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(params, translationParams{Texts: []string{"unchanged", "日本語😀", "追加"}, TargetLanguage: "French"}) {
+		if !reflect.DeepEqual(params, translationParams{Lines: []translationLine{{Line: 0, Text: "unchanged"}, {Line: 2, Text: "日本語😀"}, {Line: 4, Text: "追加"}}, TargetLanguage: "French"}) {
 			t.Fatalf("unexpected translation input: %+v", params)
 		}
-		return `{"translations":["same", "translated", "added"]}`, nil
+		return translationReply(t, input, []string{"same", "translated", "added"}), nil
 	})
 	if code != 0 || err != nil || calls != 1 {
 		t.Fatalf("code=%d err=%v calls=%d", code, err, calls)
@@ -201,7 +204,7 @@ func Test_ModelCatalogSelectionAndRecovery(t *testing.T) {
 				if input.Model != tt.want || tt.want == "" {
 					t.Fatalf("unexpected selected model %q", input.Model)
 				}
-				return `{"translations":["translated"]}`, nil
+				return translationReply(t, input, []string{"translated"}), nil
 			}, func(context.Context) ([]codexModel, error) {
 				catalogCalls++
 				if catalogCalls <= tt.failures {
@@ -244,7 +247,7 @@ func Test_AppendLineSendsOnlyAddedLineInSameConversation(t *testing.T) {
 			t.Fatalf("lost file conversation: %q", request.DocumentURI)
 		}
 		calls = append(calls, params)
-		return `{"translations":["translated"]}`, nil
+		return translationReply(t, request, []string{"translated"}), nil
 	})
 	if err != nil || code != 0 {
 		t.Fatalf("serve = %d, %v", code, err)
@@ -252,7 +255,7 @@ func Test_AppendLineSendsOnlyAddedLineInSameConversation(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("calls = %+v", calls)
 	}
-	if !reflect.DeepEqual(calls[0].Texts, []string{"翻訳する行"}) || !reflect.DeepEqual(calls[1].Texts, []string{"追加の行"}) {
+	if !reflect.DeepEqual(calls[0].Lines, []translationLine{{Line: 0, Text: "翻訳する行"}}) || !reflect.DeepEqual(calls[1].Lines, []translationLine{{Line: 1, Text: "追加の行"}}) {
 		t.Fatalf("unchanged lines were retranslated: %+v", calls)
 	}
 	encoded, err := json.Marshal(calls[1])
@@ -263,13 +266,13 @@ func Test_AppendLineSendsOnlyAddedLineInSameConversation(t *testing.T) {
 	if err := json.Unmarshal(encoded, &fields); err != nil {
 		t.Fatal(err)
 	}
-	if len(fields) != 2 || fields["texts"] == nil || fields["targetLanguage"] == nil {
+	if len(fields) != 2 || fields["lines"] == nil || fields["targetLanguage"] == nil {
 		t.Fatalf("unexpected prompt fields: %s", encoded)
 	}
 }
 
 func Test_VisibleRequestsTranslateMissingAndReuseAllExistingLines(t *testing.T) {
-	var calls [][]string
+	var calls [][]translationLine
 	run := func(_ context.Context, request agentInput) (string, error) {
 		if request.DocumentURI != "file:///a.md" {
 			t.Fatal("file conversation lost")
@@ -278,20 +281,19 @@ func Test_VisibleRequestsTranslateMissingAndReuseAllExistingLines(t *testing.T) 
 		if err := json.Unmarshal([]byte(request.Text), &params); err != nil {
 			t.Fatal(err)
 		}
-		calls = append(calls, params.Texts)
+		calls = append(calls, params.Lines)
 		var translations []string
-		for _, text := range params.Texts {
-			translations = append(translations, strings.ToUpper(text))
+		for _, line := range params.Lines {
+			translations = append(translations, strings.ToUpper(line.Text))
 		}
-		data, _ := json.Marshal(map[string]any{"translations": translations})
-		return string(data), nil
+		return translationReply(t, request, translations), nil
 	}
 	updates := runCacheSession(t, &translationCache{}, run, initializeEnglish, openUnchanged,
 		translateUnchanged, translateUnchanged,
 		`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":2},"contentChanges":[{"text":"already\nuntouched\nadded"}]}}`,
 		translateSnapshot(2, "already\nuntouched\nadded"))
-	if !reflect.DeepEqual(calls, [][]string{{"already", "untouched"}, {"added"}}) {
-		t.Fatalf("unexpected inference: %q", calls)
+	if !reflect.DeepEqual(calls, [][]translationLine{{{Line: 0, Text: "already"}, {Line: 1, Text: "untouched"}}, {{Line: 2, Text: "added"}}}) {
+		t.Fatalf("unexpected inference: %+v", calls)
 	}
 	if !updates[0].Pending || len(updates[0].Translations) != 2 {
 		t.Fatal("missing initial progress")
@@ -307,9 +309,9 @@ func Test_VisibleRequestsTranslateMissingAndReuseAllExistingLines(t *testing.T) 
 
 func Test_ClientRestoresResultsIntoNewServerWithoutInferenceOnOpen(t *testing.T) {
 	calls := 0
-	saved := runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
+	saved := runCacheSession(t, &translationCache{}, func(_ context.Context, input agentInput) (string, error) {
 		calls++
-		return `{"translations":["already", ""]}`, nil
+		return translationReply(t, input, []string{"already", "untouched"}), nil
 	}, initializeEnglish, openUnchanged, translateUnchanged)
 	if calls != 1 {
 		t.Fatalf("runs = %d", calls)
@@ -322,21 +324,21 @@ func Test_ClientRestoresResultsIntoNewServerWithoutInferenceOnOpen(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	updates := runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
+	updates := runCacheSession(t, &translationCache{}, func(_ context.Context, input agentInput) (string, error) {
 		t.Fatal("client-supplied cached results must not invoke inference")
 		return "", nil
 	}, string(initialized), openUnchanged, translateUnchanged)
 	if len(updates) != 2 || !updates[0].Restored || len(updates[0].Translations) != 2 {
 		t.Fatalf("restore = %+v", updates)
 	}
-	if updates[0].Translations[1].Text != "" {
+	if updates[0].Translations[1].Text != "untouched" {
 		t.Fatal("empty translation lost")
 	}
 	// With no client-supplied state, another process has no saved results to read.
 	calls = 0
-	runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
+	runCacheSession(t, &translationCache{}, func(_ context.Context, input agentInput) (string, error) {
 		calls++
-		return `{"translations":["already", ""]}`, nil
+		return translationReply(t, input, []string{"already", "untouched"}), nil
 	}, initializeEnglish, openUnchanged, translateUnchanged)
 	if calls != 1 {
 		t.Fatal("server cache unexpectedly shared across process lifetimes")
@@ -345,12 +347,12 @@ func Test_ClientRestoresResultsIntoNewServerWithoutInferenceOnOpen(t *testing.T)
 
 func Test_OnlySuccessfulTranslationsAreCachedAndFailuresRetryOnRequest(t *testing.T) {
 	calls := 0
-	updates := runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
+	updates := runCacheSession(t, &translationCache{}, func(_ context.Context, input agentInput) (string, error) {
 		calls++
 		if calls == 1 {
 			return "", fmt.Errorf("temporary failure")
 		}
-		return `{"translations":["one", "two"]}`, nil
+		return translationReply(t, input, []string{"one", "two"}), nil
 	}, initializeEnglish, openUnchanged, translateUnchanged, translateUnchanged, translateUnchanged)
 	if calls != 2 {
 		t.Fatalf("runs = %d", calls)
@@ -363,7 +365,7 @@ func Test_OnlySuccessfulTranslationsAreCachedAndFailuresRetryOnRequest(t *testin
 func Test_LegacyInitializationImportsTranslationsWithoutOverwritingNewerCache(t *testing.T) {
 	cache := &translationCache{}
 	cache.remember("file:///a.md", "English", "already", "newer")
-	updates := runCacheSession(t, cache, func(context.Context, agentInput) (string, error) {
+	updates := runCacheSession(t, cache, func(_ context.Context, input agentInput) (string, error) {
 		t.Fatal("migrated results must not invoke the agent")
 		return "", nil
 	}, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"initialTranslations":[{"uri":"file:/a.md","targetLanguage":"English","translations":[{"sourceText":"already","text":"old"},{"sourceText":"untouched","text":"migrated"}]}]}}}`,
@@ -389,7 +391,7 @@ func Test_CacheIsSeparatedByFileAndTargetLanguage(t *testing.T) {
 
 func Test_LatestLegacyResultWinsAndFailedOrPendingResultsDoNotBecomeCached(t *testing.T) {
 	cache := &translationCache{}
-	updates := runCacheSession(t, cache, func(context.Context, agentInput) (string, error) {
+	updates := runCacheSession(t, cache, func(_ context.Context, input agentInput) (string, error) {
 		t.Fatal("initialization and open must not run inference")
 		return "", nil
 	}, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"initialTranslations":[{"uri":"file:///a.md","targetLanguage":"English","translations":[{"sourceText":"already","text":"old"}]},{"uri":"file:///a.md","targetLanguage":"English","translations":[{"sourceText":"already","text":"latest"},{"sourceText":"untouched","error":"failed"}]},{"uri":"file:///a.md","targetLanguage":"English","pending":true,"translations":[{"sourceText":"untouched","text":""}]}]}}}`,
@@ -413,19 +415,18 @@ func Test_LegacyParagraphCacheKeepsCoverageWithoutRetranslatingIndividualLines(t
 }
 
 func Test_ViewportTranslationSkipsSavesAndReusesScrolledLines(t *testing.T) {
-	var calls [][]string
+	var calls [][]translationLine
 	run := func(_ context.Context, request agentInput) (string, error) {
 		var params translationParams
 		if err := json.Unmarshal([]byte(request.Text), &params); err != nil {
 			t.Fatal(err)
 		}
-		calls = append(calls, params.Texts)
+		calls = append(calls, params.Lines)
 		var texts []string
-		for _, text := range params.Texts {
-			texts = append(texts, strings.ToUpper(text))
+		for _, line := range params.Lines {
+			texts = append(texts, strings.ToUpper(line.Text))
 		}
-		data, _ := json.Marshal(map[string]any{"translations": texts})
-		return string(data), nil
+		return translationReply(t, request, texts), nil
 	}
 	request := func(id, version, start, end int, text string) string {
 		data, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": "honnyaku/translateVisible", "params": map[string]any{
@@ -443,8 +444,8 @@ func Test_ViewportTranslationSkipsSavesAndReusesScrolledLines(t *testing.T) {
 		request(6, 1, 0, 2, "already\nuntouched"), // stale snapshot must not replace v2
 		saveNotification,
 	)
-	if !reflect.DeepEqual(calls, [][]string{{"already"}, {"untouched"}, {"edited"}}) {
-		t.Fatalf("calls: %q", calls)
+	if !reflect.DeepEqual(calls, [][]translationLine{{{Line: 0, Text: "already"}}, {{Line: 1, Text: "untouched"}}, {{Line: 0, Text: "edited"}}}) {
+		t.Fatalf("calls: %+v", calls)
 	}
 	var completed []translationUpdate
 	for _, update := range updates {
@@ -465,7 +466,7 @@ func Test_ViewportTranslationSkipsSavesAndReusesScrolledLines(t *testing.T) {
 
 func Test_ViewportTranslationRejectsInvalidWindows(t *testing.T) {
 	for _, window := range []string{`"startLine":-1,"endLine":2`, `"startLine":2,"endLine":2`, `"startLine":4,"endLine":1`} {
-		runCacheSession(t, &translationCache{}, func(context.Context, agentInput) (string, error) {
+		runCacheSession(t, &translationCache{}, func(_ context.Context, input agentInput) (string, error) {
 			t.Fatal("invalid window invoked inference")
 			return "", nil
 		},
@@ -495,7 +496,7 @@ func Test_ClearTranslationCache(t *testing.T) {
 		if in.DocumentURI != "file:///a.md" {
 			t.Fatalf("unexpected document: %s", in.DocumentURI)
 		}
-		return `{"translations":["new"]}`, nil
+		return translationReply(t, in, []string{"new"}), nil
 	})
 	if err != nil || calls != 1 {
 		t.Fatalf("serve error = %v, calls = %d", err, calls)
@@ -506,12 +507,11 @@ func Test_ClearTranslationCache(t *testing.T) {
 	}
 }
 
-func Test_ServerStreamsBeforeCompletionAndDoesNotCacheFailure(t *testing.T) {
+func Test_ServerStreamsValidatedLinesButDoesNotCacheFailedResponse(t *testing.T) {
 	cache := &translationCache{}
 	updates := runCacheSession(t, cache, func(_ context.Context, input agentInput) (string, error) {
-		input.OnTextDelta(`{"translations":["first",`)
-		if len(cache.entries("file:///a.md", "English")) != 0 {
-			t.Fatal("partial result cached")
+		if input.OnTextDelta != nil {
+			input.OnTextDelta(`{"lines":[{"line":0,"character":0,"text":"first"},`)
 		}
 		return "", context.DeadlineExceeded
 	}, initializeEnglish, openUnchanged, translateUnchanged)
