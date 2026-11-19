@@ -115,9 +115,11 @@ func serveWithCache(input io.Reader, output io.Writer, run agent, cache *transla
 		cached, units := cache.selectUnits(uri, targetLanguage, doc.text)
 		if ranges != nil {
 			cached, units = []unitTranslation{}, nil
-			for _, unit := range rangedTranslationUnits(doc.text, *ranges) {
+			for _, unit := range rangedGroupedTranslationUnits(doc.text, *ranges) {
 				if text, ok := cache.entries(uri, targetLanguage)[unit.Text]; ok {
 					cached = append(cached, unitTranslation{Range: unit.Range, SourceText: unit.Text, Text: text})
+				} else if message := cache.failed(uri, targetLanguage, unit.Text); message != "" {
+					cached = append(cached, unitTranslation{Range: unit.Range, SourceText: unit.Text, Error: message})
 				} else {
 					units = append(units, unit)
 				}
@@ -125,7 +127,7 @@ func serveWithCache(input io.Reader, output io.Writer, run agent, cache *transla
 		}
 		selected := units[:0]
 		for _, unit := range units {
-			if unit.Range.Start.Line >= visible.StartLine && unit.Range.Start.Line < visible.EndLine {
+			if unit.Range.End.Line >= visible.StartLine && unit.Range.Start.Line < visible.EndLine {
 				selected = append(selected, unit)
 			}
 		}
@@ -211,6 +213,10 @@ func serveWithCache(input io.Reader, output io.Writer, run agent, cache *transla
 				item := unitTranslation{Range: unit.Range, SourceText: unit.Text}
 				if err != nil {
 					item.Error = err.Error()
+					var invalid *translationValidationError
+					if errors.As(err, &invalid) {
+						cache.reject(uri, targetLanguage, unit.Text, item.Error)
+					}
 				} else {
 					item.Text = translated[i]
 					cache.remember(uri, targetLanguage, item.SourceText, item.Text)
@@ -350,6 +356,11 @@ messages:
 					break
 				}
 				delete(cache.files, cacheKey(params.URI, params.TargetLanguage))
+				for key := range cache.invalid {
+					if key.translationCacheKey == cacheKey(params.URI, params.TargetLanguage) {
+						delete(cache.invalid, key)
+					}
+				}
 			case "honnyaku/translateVisible":
 				var params visibleTranslationParams
 				if err := json.Unmarshal(req.Params, &params); err != nil ||
@@ -483,7 +494,24 @@ type modelListUpdate struct {
 // The client owns persistence and seeds this per-process memory cache on initialization.
 type translationCacheKey struct{ uri, language string }
 type translationCache struct {
-	files map[translationCacheKey]map[string]string
+	files   map[translationCacheKey]map[string]string
+	invalid map[translationFailureKey]string
+}
+
+type translationFailureKey struct {
+	translationCacheKey
+	source string
+}
+
+func (c *translationCache) failed(uri, language, source string) string {
+	return c.invalid[translationFailureKey{cacheKey(uri, language), source}]
+}
+
+func (c *translationCache) reject(uri, language, source, message string) {
+	if c.invalid == nil {
+		c.invalid = make(map[translationFailureKey]string)
+	}
+	c.invalid[translationFailureKey{cacheKey(uri, language), source}] = message
 }
 
 func cacheKey(uri, language string) translationCacheKey {
@@ -515,67 +543,18 @@ func (c *translationCache) importTranslation(uri, language, source, translated s
 	if _, exists := c.entries(uri, language)[source]; !exists {
 		c.remember(uri, language, source, translated)
 	}
-	originalLines, translatedLines := strings.Split(source, "\n"), strings.Split(translated, "\n")
-	if len(originalLines) > 1 && len(originalLines) == len(translatedLines) {
-		for i, line := range originalLines {
-			c.importTranslation(uri, language, line, translatedLines[i])
-		}
-	}
 }
 
 func (c *translationCache) selectUnits(uri, language, source string) ([]unitTranslation, []translationUnit) {
 	entries := c.entries(uri, language)
-	all := translationUnits(source)
+	all := groupedTranslationUnits(translationUnits(source))
 	cached := []unitTranslation{}
-	covered := make(map[int]bool)
-	// Preserve previously stored paragraph results during migration, even when they aren't line-aligned.
-	var paragraphs []string
-	for text := range entries {
-		if strings.Contains(text, "\n") {
-			paragraphs = append(paragraphs, text)
-		}
-	}
-	sort.Slice(paragraphs, func(i, j int) bool {
-		if len(paragraphs[i]) == len(paragraphs[j]) {
-			return paragraphs[i] < paragraphs[j]
-		}
-		return len(paragraphs[i]) > len(paragraphs[j])
-	})
-	lines := strings.Split(source, "\n")
-	for _, text := range paragraphs {
-		original := strings.Split(text, "\n")
-		for start := 0; start+len(original) <= len(lines); start++ {
-			end := start + len(original) - 1
-			if strings.Join(lines[start:end+1], "\n") != text {
-				continue
-			}
-			overlaps := false
-			for line := start; line <= end; line++ {
-				if covered[line] {
-					overlaps = true
-				}
-			}
-			if overlaps {
-				continue
-			}
-			last := translationUnits(original[len(original)-1])
-			endCharacter := 0
-			if len(last) > 0 {
-				endCharacter = last[0].Range.End.Character
-			}
-			cached = append(cached, unitTranslation{Range: textRange{position{start, 0}, position{end, endCharacter}}, SourceText: text, Text: entries[text]})
-			for line := start; line <= end; line++ {
-				covered[line] = true
-			}
-		}
-	}
 	var missing []translationUnit
 	for _, unit := range all {
-		if covered[unit.Range.Start.Line] {
-			continue
-		}
 		if text, ok := entries[unit.Text]; ok {
 			cached = append(cached, unitTranslation{Range: unit.Range, SourceText: unit.Text, Text: text})
+		} else if message := c.failed(uri, language, unit.Text); message != "" {
+			cached = append(cached, unitTranslation{Range: unit.Range, SourceText: unit.Text, Error: message})
 		} else {
 			missing = append(missing, unit)
 		}

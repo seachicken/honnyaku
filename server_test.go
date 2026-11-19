@@ -223,7 +223,7 @@ func Test_ModelCatalogSelectionAndRecovery(t *testing.T) {
 	}
 }
 
-func Test_AppendLineSendsOnlyAddedLineInSameConversation(t *testing.T) {
+func Test_AppendLineRetranslatesBlockInSameConversation(t *testing.T) {
 	var input, output bytes.Buffer
 	for _, message := range []string{
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
@@ -247,16 +247,16 @@ func Test_AppendLineSendsOnlyAddedLineInSameConversation(t *testing.T) {
 			t.Fatalf("lost file conversation: %q", request.DocumentURI)
 		}
 		calls = append(calls, params)
-		return translationReply(t, request, []string{"translated"}), nil
+		return translationReply(t, request, []string{strings.Repeat("translated\n", strings.Count(params.Lines[0].Text, "\n")) + "translated"}), nil
 	})
 	if err != nil || code != 0 {
 		t.Fatalf("serve = %d, %v", code, err)
 	}
-	if len(calls) != 2 {
+	if len(calls) != 3 {
 		t.Fatalf("calls = %+v", calls)
 	}
-	if !reflect.DeepEqual(calls[0].Lines, []translationLine{{Line: 0, Text: "翻訳する行"}}) || !reflect.DeepEqual(calls[1].Lines, []translationLine{{Line: 1, Text: "追加の行"}}) {
-		t.Fatalf("unchanged lines were retranslated: %+v", calls)
+	if !reflect.DeepEqual(calls[0].Lines, []translationLine{{Line: 0, Text: "翻訳する行"}}) || !reflect.DeepEqual(calls[1].Lines, []translationLine{{Line: 0, Text: "翻訳する行\n追加の行"}}) {
+		t.Fatalf("block was not retranslated: %+v", calls)
 	}
 	encoded, err := json.Marshal(calls[1])
 	if err != nil {
@@ -271,7 +271,7 @@ func Test_AppendLineSendsOnlyAddedLineInSameConversation(t *testing.T) {
 	}
 }
 
-func Test_VisibleRequestsTranslateMissingAndReuseAllExistingLines(t *testing.T) {
+func Test_VisibleRequestsReuseWholeBlocksAndRetranslateEdits(t *testing.T) {
 	var calls [][]translationLine
 	run := func(_ context.Context, request agentInput) (string, error) {
 		if request.DocumentURI != "file:///a.md" {
@@ -292,17 +292,17 @@ func Test_VisibleRequestsTranslateMissingAndReuseAllExistingLines(t *testing.T) 
 		translateUnchanged, translateUnchanged,
 		`{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///a.md","version":2},"contentChanges":[{"text":"already\nuntouched\nadded"}]}}`,
 		translateSnapshot(2, "already\nuntouched\nadded"))
-	if !reflect.DeepEqual(calls, [][]translationLine{{{Line: 0, Text: "already"}, {Line: 1, Text: "untouched"}}, {{Line: 2, Text: "added"}}}) {
+	if !reflect.DeepEqual(calls, [][]translationLine{{{Line: 0, Text: "already\nuntouched"}}, {{Line: 0, Text: "already\nuntouched\nadded"}}}) {
 		t.Fatalf("unexpected inference: %+v", calls)
 	}
-	if !updates[0].Pending || len(updates[0].Translations) != 2 {
+	if !updates[0].Pending || len(updates[0].Translations) != 1 {
 		t.Fatal("missing initial progress")
 	}
-	if !updates[3].Pending || len(updates[3].Translations) != 1 || updates[3].Translations[0].SourceText != "added" {
+	if !updates[3].Pending || len(updates[3].Translations) != 1 || updates[3].Translations[0].SourceText != "already\nuntouched\nadded" {
 		t.Fatal("cached lines included in progress")
 	}
 	last := updates[len(updates)-1]
-	if last.Pending || len(last.Translations) != 3 {
+	if last.Pending || len(last.Translations) != 1 {
 		t.Fatalf("missing cached results: %+v", last)
 	}
 }
@@ -311,7 +311,7 @@ func Test_ClientRestoresResultsIntoNewServerWithoutInferenceOnOpen(t *testing.T)
 	calls := 0
 	saved := runCacheSession(t, &translationCache{}, func(_ context.Context, input agentInput) (string, error) {
 		calls++
-		return translationReply(t, input, []string{"already", "untouched"}), nil
+		return translationReply(t, input, []string{"訳文の前半\n訳文の後半"}), nil
 	}, initializeEnglish, openUnchanged, translateUnchanged)
 	if calls != 1 {
 		t.Fatalf("runs = %d", calls)
@@ -328,17 +328,17 @@ func Test_ClientRestoresResultsIntoNewServerWithoutInferenceOnOpen(t *testing.T)
 		t.Fatal("client-supplied cached results must not invoke inference")
 		return "", nil
 	}, string(initialized), openUnchanged, translateUnchanged)
-	if len(updates) != 2 || !updates[0].Restored || len(updates[0].Translations) != 2 {
+	if len(updates) != 2 || !updates[0].Restored || len(updates[0].Translations) != 1 {
 		t.Fatalf("restore = %+v", updates)
 	}
-	if updates[0].Translations[1].Text != "untouched" {
+	if updates[0].Translations[0].Text != "訳文の前半\n訳文の後半" {
 		t.Fatal("empty translation lost")
 	}
 	// With no client-supplied state, another process has no saved results to read.
 	calls = 0
 	runCacheSession(t, &translationCache{}, func(_ context.Context, input agentInput) (string, error) {
 		calls++
-		return translationReply(t, input, []string{"already", "untouched"}), nil
+		return translationReply(t, input, []string{"訳文の前半\n訳文の後半"}), nil
 	}, initializeEnglish, openUnchanged, translateUnchanged)
 	if calls != 1 {
 		t.Fatal("server cache unexpectedly shared across process lifetimes")
@@ -352,7 +352,7 @@ func Test_OnlySuccessfulTranslationsAreCachedAndFailuresRetryOnRequest(t *testin
 		if calls == 1 {
 			return "", fmt.Errorf("temporary failure")
 		}
-		return translationReply(t, input, []string{"one", "two"}), nil
+		return translationReply(t, input, []string{"one\ntwo"}), nil
 	}, initializeEnglish, openUnchanged, translateUnchanged, translateUnchanged, translateUnchanged)
 	if calls != 2 {
 		t.Fatalf("runs = %d", calls)
@@ -369,7 +369,7 @@ func Test_LegacyInitializationImportsTranslationsWithoutOverwritingNewerCache(t 
 		t.Fatal("migrated results must not invoke the agent")
 		return "", nil
 	}, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"initialTranslations":[{"uri":"file:/a.md","targetLanguage":"English","translations":[{"sourceText":"already","text":"old"},{"sourceText":"untouched","text":"migrated"}]}]}}}`,
-		openUnchanged, translateUnchanged)
+		strings.Replace(openUnchanged, `already\nuntouched`, `already\n\nuntouched`, 1), translateSnapshot(1, "already\n\nuntouched"))
 	if len(updates) != 2 || updates[0].Translations[0].Text != "newer" || updates[0].Translations[1].Text != "migrated" {
 		t.Fatalf("migration = %+v", updates)
 	}
@@ -395,26 +395,26 @@ func Test_LatestLegacyResultWinsAndFailedOrPendingResultsDoNotBecomeCached(t *te
 		t.Fatal("initialization and open must not run inference")
 		return "", nil
 	}, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"initialTranslations":[{"uri":"file:///a.md","targetLanguage":"English","translations":[{"sourceText":"already","text":"old"}]},{"uri":"file:///a.md","targetLanguage":"English","translations":[{"sourceText":"already","text":"latest"},{"sourceText":"untouched","error":"failed"}]},{"uri":"file:///a.md","targetLanguage":"English","pending":true,"translations":[{"sourceText":"untouched","text":""}]}]}}}`,
-		openUnchanged)
+		strings.Replace(openUnchanged, `already\nuntouched`, `already\n\nuntouched`, 1))
 	if len(updates) != 1 || len(updates[0].Translations) != 1 || updates[0].Translations[0].Text != "latest" {
 		t.Fatalf("migration = %+v", updates)
 	}
-	_, missing := cache.selectUnits("file:///a.md", "English", "already\nuntouched")
+	_, missing := cache.selectUnits("file:///a.md", "English", "already\n\nuntouched")
 	if len(missing) != 1 || missing[0].Text != "untouched" {
 		t.Fatalf("failed or pending result cached: %+v", missing)
 	}
 }
 
-func Test_LegacyParagraphCacheKeepsCoverageWithoutRetranslatingIndividualLines(t *testing.T) {
+func Test_LegacyParagraphCacheInvalidatesWhenExtended(t *testing.T) {
 	cache := &translationCache{}
 	cache.importTranslation("file:///a.md", "English", "first\nsecond", "paragraph")
 	cached, missing := cache.selectUnits("file:///a.md", "English", "first\nsecond\nthird")
-	if len(cached) != 1 || cached[0].Text != "paragraph" || len(missing) != 1 || missing[0].Text != "third" {
+	if len(cached) != 0 || len(missing) != 1 || missing[0].Text != "first\nsecond\nthird" {
 		t.Fatalf("cached=%+v missing=%+v", cached, missing)
 	}
 }
 
-func Test_ViewportTranslationSkipsSavesAndReusesScrolledLines(t *testing.T) {
+func Test_ViewportTranslationIncludesWholeIntersectingBlocks(t *testing.T) {
 	var calls [][]translationLine
 	run := func(_ context.Context, request agentInput) (string, error) {
 		var params translationParams
@@ -437,14 +437,14 @@ func Test_ViewportTranslationSkipsSavesAndReusesScrolledLines(t *testing.T) {
 	updates := runCacheSession(t, &translationCache{}, run,
 		initializeEnglish,
 		openUnchanged, saveNotification,
-		request(2, 1, 0, 1, "already\nuntouched"),
-		request(3, 1, 1, 2, "already\nuntouched"),
+		request(2, 1, 1, 2, "already\nuntouched"), // viewport starts in the middle of the block
+		request(3, 1, 0, 1, "already\nuntouched"),
 		request(4, 1, 0, 2, "already\nuntouched"),
 		request(5, 2, 0, 1, "edited\nuntouched"),
 		request(6, 1, 0, 2, "already\nuntouched"), // stale snapshot must not replace v2
 		saveNotification,
 	)
-	if !reflect.DeepEqual(calls, [][]translationLine{{{Line: 0, Text: "already"}}, {{Line: 1, Text: "untouched"}}, {{Line: 0, Text: "edited"}}}) {
+	if !reflect.DeepEqual(calls, [][]translationLine{{{Line: 0, Text: "already\nuntouched"}}, {{Line: 0, Text: "edited\nuntouched"}}}) {
 		t.Fatalf("calls: %+v", calls)
 	}
 	var completed []translationUpdate
@@ -456,10 +456,10 @@ func Test_ViewportTranslationSkipsSavesAndReusesScrolledLines(t *testing.T) {
 	if len(completed) != 4 {
 		t.Fatalf("unexpected completions: %+v", completed)
 	}
-	if got := completed[1].Translations; len(got) != 2 || got[1].Range.Start.Line != 1 {
+	if got := completed[1].Translations; len(got) != 1 || got[0].Range.End.Line != 1 {
 		t.Fatalf("cached lines or source ranges lost: %+v", got)
 	}
-	if got := completed[3]; got.Version != 2 || len(got.Translations) != 2 || got.Translations[0].Text != "EDITED" {
+	if got := completed[3]; got.Version != 2 || len(got.Translations) != 1 || got.Translations[0].Text != "EDITED\nUNTOUCHED" {
 		t.Fatalf("edited snapshot: %+v", got)
 	}
 }
@@ -511,11 +511,11 @@ func Test_ServerStreamsValidatedLinesButDoesNotCacheFailedResponse(t *testing.T)
 	cache := &translationCache{}
 	updates := runCacheSession(t, cache, func(_ context.Context, input agentInput) (string, error) {
 		if input.OnTextDelta != nil {
-			input.OnTextDelta(`{"lines":[{"line":0,"character":0,"text":"first"},`)
+			input.OnTextDelta(`{"lines":[{"line":0,"character":0,"text":"first\nsecond"},`)
 		}
 		return "", context.DeadlineExceeded
 	}, initializeEnglish, openUnchanged, translateUnchanged)
-	if len(updates) != 3 || !updates[0].Pending || !updates[1].Partial || updates[1].Translations[0].Text != "first" || updates[2].Partial || updates[2].Translations[0].Error == "" {
+	if len(updates) != 3 || !updates[0].Pending || !updates[1].Partial || updates[1].Translations[0].Text != "first\nsecond" || updates[2].Partial || updates[2].Translations[0].Error == "" {
 		t.Fatalf("unexpected updates: %+v", updates)
 	}
 	if len(cache.entries("file:///a.md", "English")) != 0 {
@@ -566,4 +566,44 @@ func translateSnapshot(version int, text string) string {
 		"startLine":    0, "endLine": len(strings.Split(text, "\n")),
 	}})
 	return string(data)
+}
+
+func Test_InvalidLayoutStopsUntilSourceChangesOrRetranslate(t *testing.T) {
+	for _, ranged := range []bool{false, true} {
+		t.Run(fmt.Sprint(ranged), func(t *testing.T) {
+			request := func(version, start, end int, text string) string {
+				var m map[string]any
+				json.Unmarshal([]byte(translateSnapshot(version, text)), &m)
+				p := m["params"].(map[string]any)
+				p["startLine"], p["endLine"] = start, end
+				if ranged {
+					p["ranges"] = []textRange{{position{0, 0}, position{1, len(strings.Split(text, "\n")[1])}}}
+				}
+				b, _ := json.Marshal(m)
+				return string(b)
+			}
+			calls := 0
+			cache := &translationCache{}
+			runCacheSession(t, cache, func(_ context.Context, in agentInput) (string, error) {
+				calls++
+				return translationReply(t, in, []string{"collapsed"}), nil
+			}, initializeEnglish, openUnchanged,
+				request(1, 0, 1, "already\nuntouched"),
+				request(1, 1, 2, "already\nuntouched"),
+				request(2, 0, 2, "edited\nuntouched"),
+				request(2, 1, 2, "edited\nuntouched"),
+				`{"jsonrpc":"2.0","id":99,"method":"honnyaku/clearTranslationCache","params":{"uri":"file:///a.md","targetLanguage":"English"}}`,
+				request(2, 0, 2, "edited\nuntouched"),
+			)
+			if calls != 6 {
+				t.Fatalf("expected two attempts each for original, edit, manual retranslation; got %d", calls)
+			}
+			if len(cache.entries("file:///a.md", "English")) != 0 {
+				t.Fatal("invalid output cached as success")
+			}
+			if cache.failed("file:///other.md", "English", "edited\nuntouched") != "" || cache.failed("file:///a.md", "French", "edited\nuntouched") != "" {
+				t.Fatal("failure leaked across files/languages")
+			}
+		})
+	}
 }

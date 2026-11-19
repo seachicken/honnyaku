@@ -17,6 +17,7 @@ type agentInput struct {
 	OnModels          func([]codexModel)
 	Model             string
 	DocumentURI       string
+	Feedback          string
 	Instructions      string
 	OutputSchema      map[string]any
 	Text              string
@@ -222,7 +223,12 @@ func (c *codexClient) exchange(prompt agentInput) (string, error) {
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	params := map[string]any{"threadId": threadID, "input": []any{map[string]any{"type": "text", "text": prompt.Text}}}
+	input := []any{}
+	if prompt.Feedback != "" {
+		input = append(input, map[string]any{"type": "text", "text": prompt.Feedback})
+	}
+	input = append(input, map[string]any{"type": "text", "text": prompt.Text})
+	params := map[string]any{"threadId": threadID, "input": input}
 	if prompt.OutputSchema != nil {
 		params["outputSchema"] = prompt.OutputSchema
 	}

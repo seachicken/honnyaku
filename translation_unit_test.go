@@ -21,17 +21,17 @@ func Test_MissingTranslationUnits(t *testing.T) {
 		{"insert", "a\n\nb", "new\n\na\n\nb", []string{"new"}},
 		{"delete", "a\n\nb", "b", nil},
 		{"duplicate", "a", "a\n\na", nil},
-		{"merge", "a\n\nb", "a\nb", nil},
-		{"split", "a\nb", "a\n\nb", nil},
-		{"append line", "既訳", "既訳\n新規行", []string{"新規行"}},
-		{"insert line", "既訳一\n既訳二", "既訳一\n追加\n既訳二", []string{"追加"}},
-		{"edit line", "既訳一\n既訳二", "既訳一\n変更", []string{"変更"}},
+		{"merge", "a\n\nb", "a\nb", []string{"a\nb"}},
+		{"split", "a\nb", "a\n\nb", []string{"a", "b"}},
+		{"append line", "既訳", "既訳\n新規行", []string{"既訳\n新規行"}},
+		{"insert line", "既訳一\n既訳二", "既訳一\n追加\n既訳二", []string{"既訳一\n追加\n既訳二"}},
+		{"edit line", "既訳一\n既訳二", "既訳一\n変更", []string{"既訳一\n変更"}},
 		{"blank line", "既訳", "既訳\n", nil},
 		{"line endings", "a\r\n\r\nb", "a\n\nb", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cache := &translationCache{}
-			for _, unit := range translationUnits(tc.before) {
+			for _, unit := range groupedTranslationUnits(translationUnits(tc.before)) {
 				cache.remember("file:///a.md", "English", unit.Text, "cached")
 			}
 			_, missing := cache.selectUnits("file:///a.md", "English", tc.after)
@@ -192,7 +192,7 @@ func Test_InvalidNumberedTranslationsRetryThenFail(t *testing.T) {
 			calls := 0
 			got, err := translate(context.Background(), translationParams{Lines: []translationLine{{Line: 2, Text: "first"}, {Line: 3, Text: "second"}}}, nil, func(_ context.Context, in agentInput) (string, error) {
 				calls++
-				if calls == 2 && !strings.Contains(in.Instructions, "previous response was invalid") {
+				if calls == 2 && !strings.Contains(in.Feedback, "previous response was invalid") {
 					t.Fatal("retry lacks error")
 				}
 				return output, nil
@@ -305,5 +305,88 @@ func Test_RetryClearsPreviousStreamedLines(t *testing.T) {
 	})
 	if err != nil || calls != 2 || !reflect.DeepEqual(got, []string{"new first", "new second"}) {
 		t.Fatalf("got %q, %v (%d calls)", got, err, calls)
+	}
+}
+
+func Test_MultilineTranslationPreservesSourceLineLayout(t *testing.T) {
+	input := []translationLine{{Line: 4, Text: "This feature allows you to\ntranslate visible text."}}
+	for _, tc := range []struct {
+		text  string
+		valid bool
+	}{
+		{"表示中のテキストを翻訳できます。", false},
+		{"表示中のテキストを\n翻訳できます。", true},
+		{"\n表示中のテキストを翻訳できます。", false},
+		{"表示中のテキストを翻訳できます。\n", false}, {"", false}, {"\n", false}, {"one\ntwo\nthree", false},
+	} {
+		data, _ := json.Marshal(map[string]any{"lines": []translationLine{{Line: 4, Text: tc.text}}})
+		got, err := validateTranslationOutput(string(data), input)
+		if (err == nil) != tc.valid {
+			t.Fatalf("%q: %v", tc.text, err)
+		}
+		if tc.valid && strings.Count(got[0], "\n") != 1 {
+			t.Fatalf("line count: %q", got)
+		}
+	}
+}
+
+func Test_GroupedRangesStayIndependentAndBounded(t *testing.T) {
+	source := "first\nsecond\n\nthird"
+	groups := groupedTranslationUnits(translationUnits(source))
+	if len(groups) != 2 || groups[0].Text != "first\nsecond" || groups[0].Range.End.Line != 1 {
+		t.Fatalf("groups: %+v", groups)
+	}
+	ranges := []textRange{{position{0, 0}, position{0, 5}}, {position{1, 0}, position{1, 6}}}
+	if got := rangedGroupedTranslationUnits(source, ranges); len(got) != 2 {
+		t.Fatalf("separate selections merged: %+v", got)
+	}
+	groups = groupedTranslationUnits(translationUnits(strings.Repeat("line\n", 65)))
+	if len(groups) != 3 || groups[0].Range.End.Line != 31 || groups[2].Range.Start.Line != 64 {
+		t.Fatalf("unbounded groups: %+v", groups)
+	}
+}
+
+func Test_RedistributedBlockCacheInvalidatesTogether(t *testing.T) {
+	cache := &translationCache{}
+	cache.importTranslation("file:///a", "ja", "first\nsecond", "全文の訳\n")
+	cached, missing := cache.selectUnits("file:///a", "ja", "first\nsecond")
+	if len(cached) != 1 || len(missing) != 0 || cached[0].Text != "全文の訳\n" {
+		t.Fatalf("lost block: %+v %+v", cached, missing)
+	}
+	cached, missing = cache.selectUnits("file:///a", "ja", "first\nchanged")
+	if len(cached) != 0 || len(missing) != 1 || missing[0].Text != "first\nchanged" {
+		t.Fatalf("stale fragment reused: %+v %+v", cached, missing)
+	}
+	cached, missing = cache.selectUnits("file:///a", "ja", "first\n\nsecond")
+	if len(cached) != 0 || len(missing) != 2 {
+		t.Fatalf("redistributed cache split: %+v %+v", cached, missing)
+	}
+}
+
+func Test_CollapsedMultilineTranslationRetriesWithoutPublishingBlankPadding(t *testing.T) {
+	params := translationParams{Lines: []translationLine{{Line: 2, Text: "This feature allows you to\ntranslate visible text."}}}
+	calls := 0
+	var progress []translationLine
+	got, err := translate(context.Background(), params, func(lines []translationLine) {
+		progress = append([]translationLine(nil), lines...)
+	}, func(_ context.Context, in agentInput) (string, error) {
+		calls++
+		if calls == 1 {
+			collapsed := translationReply(t, in, []string{"この機能で表示中のテキストを翻訳できます。\n"})
+			in.OnTextDelta(collapsed)
+			if len(progress) != 0 {
+				t.Fatalf("collapsed translation published: %+v", progress)
+			}
+			return collapsed, nil
+		}
+		if !strings.Contains(in.Feedback, "previous response was invalid") {
+			t.Fatal("missing correction instruction")
+		}
+		corrected := translationReply(t, in, []string{"この機能で、表示中のテキストを\n翻訳できます。"})
+		in.OnTextDelta(corrected)
+		return corrected, nil
+	})
+	if err != nil || calls != 2 || len(progress) != 1 || !reflect.DeepEqual(got, []string{"この機能で、表示中のテキストを\n翻訳できます。"}) {
+		t.Fatalf("got %q, %v; calls=%d; progress=%+v", got, err, calls, progress)
 	}
 }
