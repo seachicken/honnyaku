@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,8 @@ import (
 type agent func(context.Context, agentInput) (string, error)
 
 type agentInput struct {
+	ReadThreadID      string
+	OnResponses       func([]string)
 	ListModels        bool
 	OnModels          func([]codexModel)
 	Model             string
@@ -103,7 +106,8 @@ func (c *codexClient) run(ctx context.Context, input agentInput) (text string, e
 		if ctx.Err() != nil {
 			text, err = "", fmt.Errorf("agent: %w", ctx.Err())
 		}
-		if err != nil {
+		var rejection *rpcError
+		if err != nil && !(input.ReadThreadID != "" && errors.As(err, &rejection)) {
 			c.close()
 		}
 	}()
@@ -139,7 +143,7 @@ func (c *codexClient) exchange(prompt agentInput) (string, error) {
 				continue
 			}
 			if msg.Error != nil {
-				return fmt.Errorf("%s: %s", method, msg.Error.Message)
+				return fmt.Errorf("%s: %w", method, msg.Error)
 			}
 			return json.Unmarshal(msg.Result, result)
 		}
@@ -154,6 +158,31 @@ func (c *codexClient) exchange(prompt agentInput) (string, error) {
 		}
 		c.initialized = true
 		c.threads = make(map[string]codexThread)
+	}
+	if prompt.ReadThreadID != "" {
+		var result struct {
+			Thread struct {
+				ID    string
+				Turns []struct{ Items []struct{ Type, Text string } }
+			}
+		}
+		if err := request("thread/read", map[string]any{"threadId": prompt.ReadThreadID, "includeTurns": true}, &result); err != nil {
+			return "", err
+		}
+		if result.Thread.ID != prompt.ReadThreadID {
+			return "", fmt.Errorf("unexpected Codex thread ID")
+		}
+		responses := []string{}
+		for _, turn := range result.Thread.Turns {
+			for _, item := range turn.Items {
+				if item.Type == "agentMessage" && strings.TrimSpace(item.Text) != "" {
+					normalized := strings.ReplaceAll(item.Text, "\r\n", "\n")
+					responses = append(responses, strings.ReplaceAll(normalized, "\r", "\n"))
+				}
+			}
+		}
+		prompt.OnResponses(responses)
+		return "", nil
 	}
 	if prompt.ListModels {
 		models := []codexModel{}

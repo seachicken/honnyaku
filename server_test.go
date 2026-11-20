@@ -32,7 +32,7 @@ func Test_Lifecycle(t *testing.T) {
 	}
 	reader := bufio.NewReader(&output)
 	for i, want := range []string{
-		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"experimental":{"honnyakuCacheDeletion":true,"honnyakuRangeTranslation":true,"honnyakuModelSelection":true,"honnyakuModelCatalog":true,"honnyakuViewportTranslation":true},"textDocumentSync":{"openClose":true,"change":1}},"serverInfo":{"name":"Honnyaku"}}}`,
+		`{"jsonrpc":"2.0","id":"1","result":{"capabilities":{"experimental":{"honnyakuThreadResponses":true,"honnyakuCacheDeletion":true,"honnyakuRangeTranslation":true,"honnyakuModelSelection":true,"honnyakuModelCatalog":true,"honnyakuViewportTranslation":true},"textDocumentSync":{"openClose":true,"change":1}},"serverInfo":{"name":"Honnyaku"}}}`,
 		`{"jsonrpc":"2.0","id":2,"result":null}`,
 	} {
 		body, err := readMessage(reader)
@@ -605,5 +605,26 @@ func Test_InvalidLayoutStopsUntilSourceChangesOrRetranslate(t *testing.T) {
 				t.Fatal("failure leaked across files/languages")
 			}
 		})
+	}
+}
+
+func TestReadThreadResponses(t *testing.T) {
+	var requests bytes.Buffer
+	reply := `{"id":1,"result":{"thread":{"id":"selected","turns":[{"items":[{"type":"userMessage","text":"prompt"},{"type":"agentMessage","text":"one"},{"type":"commandExecution","text":"output"}]},{"items":[{"type":"agentMessage","text":"two"}]}]}}}`
+	client := codexClient{initialized: true, encoder: json.NewEncoder(&requests), decoder: json.NewDecoder(strings.NewReader(reply))}
+	var messages []string
+	_, err := client.exchange(agentInput{ReadThreadID: "selected", OnResponses: func(result []string) { messages = result }})
+	if err != nil || !reflect.DeepEqual(messages, []string{"one", "two"}) {
+		t.Fatalf("read = %v, %v", messages, err)
+	}
+	var request struct {
+		Method string
+		Params struct {
+			ThreadID     string
+			IncludeTurns bool
+		}
+	}
+	if err := json.Unmarshal(requests.Bytes(), &request); err != nil || request.Method != "thread/read" || request.Params.ThreadID != "selected" || !request.Params.IncludeTurns {
+		t.Fatalf("unexpected request: %s", requests.Bytes())
 	}
 }

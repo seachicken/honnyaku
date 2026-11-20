@@ -27,6 +27,8 @@ type request struct {
 	Params  json.RawMessage `json:"params"`
 }
 
+func (e *rpcError) Error() string { return e.Message }
+
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -343,7 +345,19 @@ messages:
 				initialized = true
 				result = &initializeResult{
 					ServerInfo:   serverInfo{Name: "Honnyaku"},
-					Capabilities: serverCapabilities{Experimental: map[string]bool{"honnyakuCacheDeletion": true, "honnyakuRangeTranslation": true, "honnyakuViewportTranslation": true, "honnyakuModelSelection": true, "honnyakuModelCatalog": true}, TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1}},
+					Capabilities: serverCapabilities{Experimental: map[string]bool{"honnyakuThreadResponses": true, "honnyakuCacheDeletion": true, "honnyakuRangeTranslation": true, "honnyakuViewportTranslation": true, "honnyakuModelSelection": true, "honnyakuModelCatalog": true}, TextDocumentSync: textDocumentSyncOptions{OpenClose: true, Change: 1}},
+				}
+			case "honnyaku/readThreadResponses":
+				var params struct{ ThreadID string }
+				if json.Unmarshal(req.Params, &params) != nil || strings.TrimSpace(params.ThreadID) == "" {
+					failure = &rpcError{-32602, "Missing thread ID"}
+					break
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				_, err := run(ctx, agentInput{ReadThreadID: params.ThreadID, OnResponses: func(messages []string) { result = messages }})
+				cancel()
+				if err != nil {
+					failure = &rpcError{-32001, err.Error()}
 				}
 			case "honnyaku/clearTranslationCache":
 				var params struct {
